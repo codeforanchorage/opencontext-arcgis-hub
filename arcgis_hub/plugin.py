@@ -440,11 +440,17 @@ class ArcGISHubPlugin(DataPlugin):
 
     def _foreign_org_message(self, item: Dict[str, Any]) -> str:
         """Refusal text for an item owned by an org we do not serve."""
+        org = item.get("orgId")
+        owner = (
+            f"belongs to org {org!r}"
+            if org
+            else "belongs to another ArcGIS account"
+        )
         return (
-            f"Item {item.get('id')!r} belongs to org "
-            f"{item.get('orgId')!r}, not the configured org "
+            f"Item {item.get('id')!r} {owner}, not the configured org "
             f"{self.plugin_config.org_id!r}; this MCP only serves "
-            f"{self.plugin_config.city_name} data."
+            f"{self.plugin_config.city_name} data. Use find_gis_content "
+            f"to get the item ids this server can query."
         )
 
     def _foreign_tenant_message(
@@ -2162,6 +2168,7 @@ class ArcGISHubPlugin(DataPlugin):
 
         if filter_geometry:
             esri_filter = self._geojson_to_esri_polygon(filter_geometry)
+            self._check_lonlat_rings(esri_filter["rings"])
             # A MultiPolygon's parts may overlap or abut (two buffers,
             # adjacent parcels copied from an earlier result). Sent as
             # plain concatenated rings, the overlap reads as a hole and
@@ -2305,6 +2312,47 @@ class ArcGISHubPlugin(DataPlugin):
     # rings: 1 clipper unit = 1e-7 degree (~1.1 cm of longitude at the
     # equator). Distinct from CLIP_SCALE, which scales EPSG:3338 meters.
     UNION_DEG_SCALE = 1e7
+
+    @staticmethod
+    def _check_lonlat_rings(rings: Any) -> None:
+        """Refuse a caller's polygon that is not WGS84 lon/lat.
+
+        The filter is sent to ArcGIS as EPSG:4326. Coordinates in
+        another system (Web Mercator metres, State Plane feet) were
+        accepted and matched nothing, so the caller got a confident
+        "no features" for a polygon that was simply misread.
+        """
+        for ring in rings:
+            if not isinstance(ring, list) or len(ring) < 4:
+                raise ToolInputError(
+                    "filter_geometry: every polygon ring needs at least "
+                    "4 positions (the first repeated as the last)"
+                )
+            for pos in ring:
+                ok = (
+                    isinstance(pos, (list, tuple))
+                    and len(pos) >= 2
+                    and all(
+                        isinstance(v, (int, float))
+                        and not isinstance(v, bool)
+                        and math.isfinite(v)
+                        for v in pos[:2]
+                    )
+                )
+                if not ok:
+                    raise ToolInputError(
+                        "filter_geometry: every position must be "
+                        f"[longitude, latitude] numbers (got {pos!r})"
+                    )
+                if not (-180.0 <= pos[0] <= 180.0 and -90.0 <= pos[1] <= 90.0):
+                    raise ToolInputError(
+                        "filter_geometry must be WGS84 longitude/latitude "
+                        "in degrees, longitude first (EPSG:4326). Got "
+                        f"position {list(pos[:2])!r}, which is outside "
+                        "[-180, 180] / [-90, 90] -- the polygon looks "
+                        "projected (Web Mercator or State Plane) or has "
+                        "latitude first. Reproject it, then retry."
+                    )
 
     @staticmethod
     def _geojson_to_esri_polygon(geojson: Any) -> Dict[str, Any]:
@@ -2726,6 +2774,11 @@ class ArcGISHubPlugin(DataPlugin):
     ) -> Tuple[str, Dict[str, Any]]:
         """Search raw spatial layers."""
         city = self.plugin_config.city_name
+        if layer_type not in ("layers", "data", "all"):
+            raise ToolInputError(
+                "layer_type must be one of ['all', 'data', 'layers'] "
+                f"(got {layer_type!r})"
+            )
         if layer_type == "layers":
             item_types = self.LAYER_TYPES
         elif layer_type == "data":
@@ -2774,6 +2827,37 @@ class ArcGISHubPlugin(DataPlugin):
         )
         return text, structured
 
+    async def _missing_layer_message(
+        self, layer_url: str, error_text: str
+    ) -> Optional[str]:
+        """Explain a layer index the service does not have.
+
+        Returns None when the failure is something else. Lists the
+        layers and tables that do exist, read from the service root.
+        """
+        m = re.search(r"^(.*)/(\d+)$", layer_url)
+        if not m or "not found" not in error_text.lower():
+            return None
+        root_url, index = m.group(1), m.group(2)
+        available: List[str] = []
+        try:
+            root = await self._get_meta_json(root_url)
+            for entry in (root.get("layers") or []) + (
+                root.get("tables") or []
+            ):
+                if isinstance(entry, dict) and "id" in entry:
+                    available.append(
+                        f"{entry['id']} ({entry.get('name', '?')})"
+                    )
+        except Exception:
+            available = []
+        text = f"layer_index {index} does not exist on this service."
+        if available:
+            text += " Available layer_index values: " + ", ".join(
+                available[:40]
+            ) + "."
+        return text
+
     async def _get_layer_schema(
         self, args: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
@@ -2800,7 +2884,13 @@ class ArcGISHubPlugin(DataPlugin):
             service_url = f"{service_url}/{layer_index}"
 
         self._validate_service_url(service_url)
-        data = await self._get_meta_json(service_url)
+        try:
+            data = await self._get_meta_json(service_url)
+        except RuntimeError as e:
+            missing = await self._missing_layer_message(service_url, str(e))
+            if missing is None:
+                raise
+            raise ToolInputError(missing) from e
 
         fields = data.get("fields") or []
         layer_name = data.get("name", data.get("title", "Unknown Layer"))
@@ -4666,8 +4756,13 @@ class ArcGISHubPlugin(DataPlugin):
         resp.raise_for_status()
         data = resp.json()
         if "error" in data:
+            # Not just `message`: for a missing layer ArcGIS sends an
+            # empty message and puts the reason in `details`, which
+            # reached the caller as "Tool execution failed".
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else None
             raise RuntimeError(
-                data["error"].get("message", str(data["error"]))
+                (msg or "").strip() or self._arcgis_error_text(err)
             )
         if validate is not None:
             validate(data)
@@ -6042,7 +6137,8 @@ class ArcGISHubPlugin(DataPlugin):
         matched_polygons = int(count_data.get("count") or 0)
         if matched_polygons == 0:
             return (
-                f"Error: container_where {container_where!r} matched 0 "
+                f"Nothing was filtered: container_where "
+                f"{container_where!r} matched 0 "
                 f"polygons on container layer `{container_item_id}`. "
                 f"Did you misspell a name? Try "
                 f"`search_spatial_layers` or `query_data` to browse "
@@ -9426,6 +9522,11 @@ class ArcGISHubPlugin(DataPlugin):
                 out_fields = arguments.get("out_fields", "*")
                 order_by = arguments.get("order_by", "")
                 date_format = arguments.get("date_format", "date")
+                if date_format not in ("date", "epoch"):
+                    raise ToolInputError(
+                        "date_format must be 'date' or 'epoch' "
+                        f"(got {date_format!r})"
+                    )
                 return_geometry = bool(
                     arguments.get("return_geometry", False)
                 )

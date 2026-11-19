@@ -112,6 +112,23 @@ not format-clean.
 
 ## Releases
 
+**1.2.1** — clearer errors, found by probing every tool on a live server
+with bad input. No change to a successful result:
+
+- `get_layer_schema` with a `layer_index` the service does not have says
+  so and lists the indexes that exist. It answered "Tool execution
+  failed (RuntimeError)": ArcGIS sends that error with an empty message.
+- An inline `filter_geometry` must be WGS84 longitude/latitude. A
+  polygon in projected coordinates (or latitude first) matched nothing
+  and was reported as "no features"; it is now refused, as is a ring
+  with fewer than four positions.
+- An item of another ArcGIS account with no `orgId` is no longer said to
+  belong to "org None".
+- `date_format` and `layer_type` reject values outside their enum
+  instead of silently using the default.
+- `filter_by_polygon`: the text for a container filter that matches
+  nothing no longer begins "Error:" on a result that is not an error.
+
 **1.2.0** — four more findings from the same review. The first changes
 numbers callers see, which is why this is a minor release:
 
