@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 from pydantic import ValidationError
 
+from core.interfaces import ToolInputError
+
 from tests.profile import ExampleConfig, ExamplePlugin
 
 
@@ -2093,8 +2095,56 @@ class TestValidateServiceUrl:
 
     def test_allows_configured_portal_host(self, plugin):
         plugin._validate_service_url(
-            "https://muniorg.maps.arcgis.com/sharing/rest/content/items/abc"
+            "https://muniorg.maps.arcgis.com/arcgis/rest/services/X/"
+            "FeatureServer/0"
         )
+
+    def test_portal_host_is_allowed_for_service_endpoints_only(
+        self, plugin
+    ):
+        # /sharing/rest/content/items/<id> on the portal host serves
+        # ANY organisation's item record; get_dataset fetches those
+        # itself, with an ownership check. A caller-supplied URL there
+        # would skip that check.
+        with pytest.raises(ToolInputError, match="rest/services"):
+            plugin._validate_service_url(
+                "https://muniorg.maps.arcgis.com/sharing/rest/content/"
+                "items/abc"
+            )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # httpx resolves dot segments before sending, so each of
+            # these would be fetched from OTHERORG.
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/../OTHERORG/"
+            "arcgis/rest/services/X/FeatureServer/0",
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/./../OTHERORG/"
+            "arcgis/rest/services/X/FeatureServer/0",
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/%2e%2e/OTHERORG/"
+            "arcgis/rest/services/X/FeatureServer/0",
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/%2E%2E/OTHERORG/"
+            "arcgis/rest/services/X/FeatureServer/0",
+        ],
+    )
+    def test_rejects_dot_segments(self, plugin, url):
+        with pytest.raises(ToolInputError, match="path"):
+            plugin._validate_service_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/arcgis/rest/"
+            "services/X/FeatureServer?/0",
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/arcgis/rest/"
+            "services/X/FeatureServer/0#frag",
+            "https://services.arcgis.com/Ce3DhLRthdwbHlfF/arcgis/rest/"
+            "services/X/FeatureServer/0?",
+        ],
+    )
+    def test_rejects_query_and_fragment(self, plugin, url):
+        with pytest.raises(ToolInputError, match="query string"):
+            plugin._validate_service_url(url)
 
     def test_allows_services_with_matching_org_id(self, plugin):
         plugin._validate_service_url(

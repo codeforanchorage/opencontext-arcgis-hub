@@ -24,7 +24,7 @@ import time
 from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import httpx
 import pyclipper
@@ -290,6 +290,20 @@ class ArcGISHubPlugin(DataPlugin):
             )
         return data.get("results", [])
 
+    @staticmethod
+    def _user_query_clause(query: str) -> str:
+        """The caller's search text as one parenthesised clause.
+
+        The text is ANDed onto the scope filters (group, org, item
+        type). Left bare, an OR in it binds looser than those ANDs:
+        ``group:X AND parks OR trails`` matches every item about
+        trails, in the group or not. Wrapped, it stays inside the
+        scope. The caller's own parentheses are dropped so they cannot
+        close the wrapper early.
+        """
+        cleaned = query.replace("(", " ").replace(")", " ").strip()
+        return f"({cleaned})" if cleaned else ""
+
     async def _search_gallery(
         self, query: str, limit: int
     ) -> List[Dict[str, Any]]:
@@ -304,8 +318,8 @@ class ArcGISHubPlugin(DataPlugin):
         clauses = [
             f"({group_clause})" if len(group_ids) > 1 else group_clause
         ]
-        if query:
-            clauses.append(query)
+        if query and self._user_query_clause(query):
+            clauses.append(self._user_query_clause(query))
         return await self._run_search(" AND ".join(clauses), limit)
 
     async def _search_org_layers(
@@ -336,8 +350,8 @@ class ArcGISHubPlugin(DataPlugin):
             f"({org_filter})" if len(org_ids) > 1 else org_filter,
             f"({type_filter})",
         ]
-        if query:
-            clauses.append(query)
+        if query and self._user_query_clause(query):
+            clauses.append(self._user_query_clause(query))
         results = await self._run_search(" AND ".join(clauses), limit)
         allowed = self._allowed_org_ids
         kept: List[Dict[str, Any]] = []
@@ -447,6 +461,28 @@ class ArcGISHubPlugin(DataPlugin):
         """Text put in FRONT of a query_data response for one layer
         (known traps in that layer's data). None for no banner."""
         return None
+
+    def _apply_result_banner(
+        self, item_id: str, text: str, structured: Any
+    ) -> str:
+        """Put a layer's banner at the front of BOTH result channels.
+
+        The banner used to be prepended to the markdown only, after the
+        structured half was built, so clients that render
+        structuredContent alone never saw the traps it warns about.
+        """
+        banner = self._query_result_banner(item_id)
+        if not banner:
+            return text
+        if isinstance(structured, dict) and isinstance(
+            structured.get("caveats"), list
+        ):
+            structured["caveats"].insert(
+                0, {"code": "layer_notes", "message": banner}
+            )
+        # Front of the response: these notes change how the numbers
+        # below must be read, so they are useless appended after them.
+        return banner + "\n\n" + text
 
     async def _execute_extra_tool(
         self, tool_name: str, arguments: Dict[str, Any]
@@ -928,6 +964,7 @@ class ArcGISHubPlugin(DataPlugin):
         last_edit_date: Optional[int] = None,
         coverage_pct: Optional[float] = None,
         auto_expanded_from: Optional[int] = None,
+        limit_reached: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         """Render a record set, and return its structured twin.
 
@@ -940,6 +977,11 @@ class ArcGISHubPlugin(DataPlugin):
         ``auto_expanded_from`` is the default limit the small-table rule
         lifted (see SMALL_TABLE_ROW_THRESHOLD), so the response can say
         why it holds more rows than the default.
+
+        ``limit_reached`` is for the spatial callers: the page came back
+        full (or the server flagged more) and no total could be had, so
+        the rows are a sample of unknown size. With a ``total_count``
+        the ordinary truncation banner covers it and this is ignored.
         """
         provenance: List[str] = []
         # Structured twin of the caveats appended to `provenance` below.
@@ -963,14 +1005,41 @@ class ArcGISHubPlugin(DataPlugin):
             provenance.append(f"Retrieved: {retrieved_at}")
 
         # Truncation banner: make it impossible to miss that the listed
-        # records are a sample. Only fire when total_count proves the
-        # cap; for non-paginating callers (spatial_*) total_count is
-        # None and we stay silent.
+        # records are a sample. Fires when total_count proves the cap.
+        # The spatial callers pass a total only when their page was cut
+        # (see _spatial_overflow); when even that count failed they
+        # pass limit_reached, handled just below.
         truncated = (
             total_count is not None
             and len(records) > 0
             and total_count > len(records)
         )
+        unknown_overflow = (
+            limit_reached and total_count is None and len(records) > 0
+        )
+        if unknown_overflow:
+            caveats.append(
+                {
+                    "code": "limit_reached",
+                    "count": len(records),
+                    "limit": limit,
+                    "message": (
+                        f"Returned {len(records)} records, which is "
+                        f"the limit ({limit}); more match, and the "
+                        f"total could not be counted. The listed "
+                        f"records are a SAMPLE -- do not count or sum "
+                        f"them as if they were the whole set. Raise "
+                        f"`limit`, or narrow `where`."
+                    ),
+                }
+            )
+            provenance.append(
+                f"**TRUNCATED:** returned {len(records)} records, "
+                f"which is the limit ({limit}); more match, and the "
+                f"total could not be counted. The records below are a "
+                f"SAMPLE -- do not count or sum them as if they were "
+                f"the whole set. Raise `limit`, or narrow `where`."
+            )
         complete = (
             total_count is not None and len(records) == total_count
         )
@@ -1168,7 +1237,7 @@ class ArcGISHubPlugin(DataPlugin):
                 "summary": {
                     "returned": len(rendered_rows),
                     "total_count": total_count,
-                    "truncated": bool(truncated),
+                    "truncated": bool(truncated or unknown_overflow),
                     "complete": bool(complete),
                 },
                 "rows": rendered_rows,
@@ -1715,7 +1784,7 @@ class ArcGISHubPlugin(DataPlugin):
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
                 f"Feature Service query error (HTTP {e.response.status_code}): "
-                f"{e.response.text}"
+                f"{e.response.text[:300]}"
             ) from e
 
         try:
@@ -1765,6 +1834,7 @@ class ArcGISHubPlugin(DataPlugin):
         lat: float,
         filters: Optional[Dict[str, Any]] = None,
         limit: int = 10,
+        info: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Find polygon features in a Feature Service that contain a point.
 
@@ -1772,6 +1842,9 @@ class ArcGISHubPlugin(DataPlugin):
         WGS84 (EPSG:4326). Input SR is pinned server-side so callers
         cannot supply an arbitrary CRS. Returns attributes only; geometry
         is suppressed to keep payloads small.
+
+        Pass a dict as ``info`` to learn whether the result was cut at
+        ``limit`` (see ``_spatial_overflow``).
         """
         if limit < 1:
             raise ToolInputError(f"limit must be at least 1 (got {limit})")
@@ -1832,7 +1905,7 @@ class ArcGISHubPlugin(DataPlugin):
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
                 f"Feature Service spatial query error "
-                f"(HTTP {e.response.status_code}): {e.response.text}"
+                f"(HTTP {e.response.status_code}): {e.response.text[:300]}"
             ) from e
 
         try:
@@ -1861,8 +1934,104 @@ class ArcGISHubPlugin(DataPlugin):
                 )
             )
 
-        features = data.get("features", [])
+        features = data.get("features") or []
+        await self._spatial_overflow(
+            "get",
+            query_url,
+            params,
+            data,
+            returned=len(features),
+            requested=min(limit, 50),
+            info=info,
+        )
         return [f.get("attributes", {}) for f in features]
+
+    # {tool name: {argument name: declared JSON type}}, built on first
+    # use by _clean_arguments.
+    _arg_types: Optional[Dict[str, Dict[str, Any]]] = None
+
+    # Query parameters that shape the page, not the match set; the
+    # count twin of a query drops them.
+    _PAGE_ONLY_PARAMS = frozenset(
+        {
+            "outFields",
+            "resultRecordCount",
+            "resultOffset",
+            "returnGeometry",
+            "outSR",
+            "maxAllowableOffset",
+            "orderByFields",
+            "f",
+        }
+    )
+
+    async def _spatial_overflow(
+        self,
+        method: str,
+        query_url: str,
+        params: Dict[str, Any],
+        data: Dict[str, Any],
+        returned: int,
+        requested: int,
+        info: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record in ``info`` whether a spatial page was cut short.
+
+        A page that came back full, or that the server flagged with
+        exceededTransferLimit, may be a sample. In that case (and only
+        then, so the ordinary small answer costs no extra request) run
+        the same query as returnCountOnly. ``info`` receives
+        ``total_count`` when more match than were returned, else
+        ``limit_reached`` when the count could not be had. Neither key
+        is set when the page is the whole answer.
+        """
+        if info is None:
+            return
+        props = data.get("properties")
+        exceeded = bool(
+            data.get("exceededTransferLimit")
+            or (
+                isinstance(props, dict)
+                and props.get("exceededTransferLimit")
+            )
+        )
+        if returned == 0 or (not exceeded and returned < requested):
+            return
+        count_params = {
+            k: v
+            for k, v in params.items()
+            if k not in self._PAGE_ONLY_PARAMS
+        }
+        count_params["returnCountOnly"] = "true"
+        count_params["f"] = "json"
+        count: Any = None
+        try:
+            if method == "post":
+                resp = await self._send(
+                    "post", query_url, data=count_params
+                )
+            else:
+                resp = await self._send(
+                    "get", query_url, params=count_params
+                )
+            resp.raise_for_status()
+            body = resp.json()
+            if isinstance(body, dict) and not body.get("error"):
+                count = body.get("count")
+        except Exception as exc:  # the rows are still worth returning
+            logger.warning(
+                "Spatial count twin failed for %s: %s",
+                self._url_label(query_url),
+                exc,
+            )
+        if isinstance(count, bool) or not isinstance(count, int):
+            info["limit_reached"] = True
+        elif count > returned:
+            info["total_count"] = count
+        elif exceeded:
+            # The server says more exist but counts no more than we
+            # hold: trust the flag over the arithmetic.
+            info["limit_reached"] = True
 
     _SPATIAL_REL_MAP = {
         "intersects": "esriSpatialRelIntersects",
@@ -1927,8 +2096,12 @@ class ArcGISHubPlugin(DataPlugin):
         return_geometry: bool = False,
         distance: Optional[float] = None,
         units: str = "meters",
+        info: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Find features in a target layer that spatially relate to a polygon filter.
+
+        Pass a dict as ``info`` to learn whether the result was cut at
+        ``limit`` (see ``_spatial_overflow``).
 
         The filter polygon is supplied either inline as GeoJSON via
         ``filter_geometry`` (Polygon, MultiPolygon, or Feature), or by
@@ -1960,9 +2133,10 @@ class ArcGISHubPlugin(DataPlugin):
                 raise ToolInputError(
                     f"distance must be a number (got {distance!r})"
                 ) from exc
-            if buffer_distance < 0:
+            if not math.isfinite(buffer_distance) or buffer_distance < 0:
                 raise ToolInputError(
-                    f"distance must be >= 0 (got {buffer_distance})"
+                    f"distance must be a finite number >= 0 "
+                    f"(got {distance!r})"
                 )
             if buffer_distance == 0:
                 buffer_distance = None  # no buffer; treat as exact
@@ -1988,6 +2162,21 @@ class ArcGISHubPlugin(DataPlugin):
 
         if filter_geometry:
             esri_filter = self._geojson_to_esri_polygon(filter_geometry)
+            # A MultiPolygon's parts may overlap or abut (two buffers,
+            # adjacent parcels copied from an earlier result). Sent as
+            # plain concatenated rings, the overlap reads as a hole and
+            # targets inside it are dropped -- the same failure
+            # _fetch_filter_polygon unions away for layer filters.
+            inner = filter_geometry
+            if inner.get("type") == "Feature":
+                inner = inner.get("geometry") or {}
+            if (
+                inner.get("type") == "MultiPolygon"
+                and len(inner.get("coordinates") or []) > 1
+            ):
+                unioned = self._union_esri_rings(esri_filter["rings"])
+                if unioned:
+                    esri_filter["rings"] = unioned
         else:
             esri_filter = await self._fetch_filter_polygon(
                 filter_item_id, filter_where
@@ -2051,7 +2240,7 @@ class ArcGISHubPlugin(DataPlugin):
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
                 f"Feature Service spatial query error "
-                f"(HTTP {e.response.status_code}): {e.response.text}"
+                f"(HTTP {e.response.status_code}): {e.response.text[:300]}"
             ) from e
 
         try:
@@ -2080,7 +2269,16 @@ class ArcGISHubPlugin(DataPlugin):
                 )
             )
 
-        features = data.get("features", [])
+        features = data.get("features") or []
+        await self._spatial_overflow(
+            "post",
+            query_url,
+            params,
+            data,
+            returned=len(features),
+            requested=effective_limit,
+            info=info,
+        )
         if return_geometry:
             return [
                 {
@@ -2604,7 +2802,7 @@ class ArcGISHubPlugin(DataPlugin):
         self._validate_service_url(service_url)
         data = await self._get_meta_json(service_url)
 
-        fields = data.get("fields", [])
+        fields = data.get("fields") or []
         layer_name = data.get("name", data.get("title", "Unknown Layer"))
         geometry_type = data.get("geometryType", "N/A")
         max_records = data.get("maxRecordCount", "Unknown")
@@ -2618,7 +2816,7 @@ class ArcGISHubPlugin(DataPlugin):
                 f
                 for f in fields
                 if keyword in f.get("name", "").lower()
-                or keyword in f.get("alias", "").lower()
+                or keyword in (f.get("alias") or "").lower()
             ]
 
         max_records_int = (
@@ -2771,7 +2969,9 @@ class ArcGISHubPlugin(DataPlugin):
         # the field_keyword so the sample is at least biased toward services
         # whose titles/descriptions mention the attribute of interest.
         effective_service_filter = service_keyword or field_keyword
-        clauses.append(effective_service_filter)
+        scoped_filter = self._user_query_clause(effective_service_filter)
+        if scoped_filter:
+            clauses.append(scoped_filter)
         candidates = await self._run_search(" AND ".join(clauses), limit)
 
         def _structured(
@@ -2851,11 +3051,16 @@ class ArcGISHubPlugin(DataPlugin):
             item: Dict[str, Any],
         ) -> List[Dict[str, Any]]:
             url = (item.get("url") or "").rstrip("/")
+            # A candidate that cannot be inspected is a service that was
+            # NOT checked; counting it as inspected-and-clean reported
+            # "no matching fields" for layers nobody looked at.
             if not url:
+                failed["services"] += 1
                 return []
             try:
                 self._validate_service_url(url)
             except ValueError:
+                failed["services"] += 1
                 return []
             async with inspect_sem:
                 return await _inspect_service(item, url)
@@ -2869,8 +3074,19 @@ class ArcGISHubPlugin(DataPlugin):
                     url, params={"f": "json"}, timeout=10.0
                 )
                 root = resp.json()
-                layer_list = root.get("layers", [])
-                if not layer_list:
+                if not isinstance(root, dict) or root.get("error"):
+                    # HTTP 200 with an error body (token required, bad
+                    # request): unread, not empty.
+                    raise RuntimeError("service root returned an error")
+                # An item URL that already ends in a layer index
+                # (.../FeatureServer/0, usual for single-layer items)
+                # IS the layer: its JSON has `fields` and no `layers`,
+                # and asking for .../0/0 only yields an error body.
+                url_is_layer = bool(re.search(r"/\d+$", url))
+                layer_list = root.get("layers") or []
+                if url_is_layer:
+                    layer_list = [{"id": root.get("id", 0)}]
+                elif not layer_list:
                     # Fallback: single-layer service, check /0
                     layer_list = [{"id": 0}]
 
@@ -2878,17 +3094,25 @@ class ArcGISHubPlugin(DataPlugin):
                 for layer_meta in layer_list:
                     layer_id = layer_meta.get("id", 0)
                     try:
-                        lr = await self._send("get",
-                            f"{url}/{layer_id}",
-                            params={"f": "json"},
-                            timeout=10.0,
-                        )
-                        data = lr.json()
+                        if url_is_layer:
+                            data = root
+                        else:
+                            lr = await self._send("get",
+                                f"{url}/{layer_id}",
+                                params={"f": "json"},
+                                timeout=10.0,
+                            )
+                            data = lr.json()
+                        if not isinstance(data, dict) or data.get("error"):
+                            raise RuntimeError(
+                                "layer metadata returned an error"
+                            )
                         matching = [
                             f
-                            for f in data.get("fields", [])
+                            for f in data.get("fields") or []
                             if field_keyword in f.get("name", "").lower()
-                            or field_keyword in f.get("alias", "").lower()
+                            or field_keyword
+                            in (f.get("alias") or "").lower()
                         ]
                         if matching:
                             hits.append(
@@ -3027,6 +3251,25 @@ class ArcGISHubPlugin(DataPlugin):
         host = (parsed.hostname or "").lower()
         if not host:
             raise ToolInputError("service URL must include a hostname")
+        # The checks below read the path as written, but the HTTP client
+        # resolves "." and ".." segments before sending, so
+        # /<our-org>/../<other-org>/... would pass the org-prefix test
+        # and then be fetched from the other org. A query or fragment
+        # likewise hides the real path from the layer-index check.
+        # None of these occur in a real service URL: refuse them.
+        if parsed.query or parsed.fragment or "?" in url or "#" in url:
+            raise ToolInputError(
+                "service URL must not include a query string or "
+                "fragment"
+            )
+        decoded_path = unquote(parsed.path)
+        if "\\" in url or "\\" in decoded_path or any(
+            seg in (".", "..") for seg in decoded_path.split("/")
+        ):
+            raise ToolInputError(
+                "service URL must not contain '.' or '..' path "
+                "segments or backslashes"
+            )
 
         if any(
             host == suffix.lstrip(".") or host.endswith(suffix)
@@ -3039,6 +3282,14 @@ class ArcGISHubPlugin(DataPlugin):
         if host == "arcgis.com" or host.endswith(".arcgis.com"):
             portal_host = self._portal_host
             if portal_host and host == portal_host:
+                # Only service endpoints: the portal host also serves
+                # /sharing/rest/content/items/<any id>, which would let
+                # a caller read another organisation's item record.
+                if "/rest/services/" not in parsed.path.lower():
+                    raise ToolInputError(
+                        "service URL on the portal host must be a "
+                        "/rest/services/ endpoint"
+                    )
                 return url
             org_id = (self.plugin_config.org_id or "").lower() if self.plugin_config else ""
             path_lower = parsed.path.lower()
@@ -3664,12 +3915,19 @@ class ArcGISHubPlugin(DataPlugin):
             sx = sum(p[0] for p in pts) / m
             sy = sum(p[1] for p in pts) / m
             return (sx, sy)
+        # Work relative to the first vertex. On raw lon/lat (about
+        # -150, 61) the cross terms are ~9,000 while a building-sized
+        # ring's area is ~1e-8, so the sums cancel and the result for a
+        # 10 m square lands hundreds of metres away. Shifted to a local
+        # origin the terms are the size of the ring itself.
+        ox, oy = pts[0][0], pts[0][1]
         cx = 0.0
         cy = 0.0
         a = 0.0
         for i in range(m):
-            x1, y1 = pts[i][0], pts[i][1]
-            x2, y2 = pts[(i + 1) % m][0], pts[(i + 1) % m][1]
+            x1, y1 = pts[i][0] - ox, pts[i][1] - oy
+            x2 = pts[(i + 1) % m][0] - ox
+            y2 = pts[(i + 1) % m][1] - oy
             cross = x1 * y2 - x2 * y1
             a += cross
             cx += (x1 + x2) * cross
@@ -3679,7 +3937,7 @@ class ArcGISHubPlugin(DataPlugin):
             sx = sum(p[0] for p in pts) / m
             sy = sum(p[1] for p in pts) / m
             return (sx, sy)
-        return (cx / (6.0 * a), cy / (6.0 * a))
+        return (ox + cx / (6.0 * a), oy + cy / (6.0 * a))
 
     @classmethod
     def _geometry_centroid(
@@ -4065,6 +4323,17 @@ class ArcGISHubPlugin(DataPlugin):
             out_fields=group_by_field,
             limit=self.AGG_SOURCE_LIMIT,
         )
+        if len(polygons) >= self.AGG_SOURCE_LIMIT:
+            # Bucketing into the first 5,000 would leave every source
+            # feature in the rest reported as "unmatched", and the
+            # partial set would sit in the cache for a day.
+            raise ToolInputError(
+                f"the aggregation layer has at least "
+                f"{self.AGG_SOURCE_LIMIT:,} polygons matching agg_where "
+                f"{agg_where!r}; aggregate_by_polygon handles fewer "
+                f"than that. Narrow agg_where, or aggregate into a "
+                f"coarser layer."
+            )
         result = [
             {
                 "group": (f.get("properties") or {}).get(group_by_field),
@@ -4370,14 +4639,16 @@ class ArcGISHubPlugin(DataPlugin):
         features: List[Dict[str, Any]] = []
         offset = 0
         page_size = self.AGG_PAGE_SIZE
+        last_first_id: Any = None
         while len(features) < limit:
+            requested = min(page_size, limit - len(features))
             params = {
                 "where": where,
                 "outFields": out_fields,
                 "returnGeometry": "true",
                 "outSR": "4326",
                 "f": "geojson",
-                "resultRecordCount": str(min(page_size, limit - len(features))),
+                "resultRecordCount": str(requested),
                 "resultOffset": str(offset),
                 "maxAllowableOffset": str(self.GEOMETRY_SIMPLIFY_OFFSET_DEG),
             }
@@ -4394,10 +4665,34 @@ class ArcGISHubPlugin(DataPlugin):
             page = data.get("features") or []
             if not page:
                 break
+            # A server that ignores resultOffset returns page one again;
+            # stop rather than collect the same features until `limit`.
+            first_id = page[0].get("id") if isinstance(page[0], dict) else None
+            if offset and first_id is not None and first_id == last_first_id:
+                logger.warning(
+                    "Paging stalled on %s: resultOffset=%s returned the "
+                    "previous page again",
+                    self._url_label(query_url),
+                    offset,
+                )
+                break
+            last_first_id = first_id
             features.extend(page)
             offset += len(page)
-            # If we got less than requested, we're done.
-            if len(page) < page_size:
+            # A short page is the end ONLY if the server does not say
+            # otherwise: a layer whose maxRecordCount is below the page
+            # size returns short pages all the way through, flagged
+            # with exceededTransferLimit. Stopping on length alone
+            # fetched one page of such a layer and reported it as all.
+            props = data.get("properties")
+            exceeded = bool(
+                data.get("exceededTransferLimit")
+                or (
+                    isinstance(props, dict)
+                    and props.get("exceededTransferLimit")
+                )
+            )
+            if len(page) < requested and not exceeded:
                 break
         return features
 
@@ -4424,7 +4719,9 @@ class ArcGISHubPlugin(DataPlugin):
             raw_sum_fields = [
                 s.strip() for s in raw_sum_fields.split(",") if s.strip()
             ]
-        sum_fields: List[str] = list(raw_sum_fields)
+        # Order-preserving dedupe: a repeated field would be added to
+        # its own running sum twice per feature.
+        sum_fields: List[str] = list(dict.fromkeys(raw_sum_fields))
         include_count = bool(args.get("count", True))
         # Validate both WHERE clauses up front so malformed/injection
         # attempts are rejected before any upstream I/O (otherwise a bad
@@ -4439,8 +4736,12 @@ class ArcGISHubPlugin(DataPlugin):
                 "centroid_mode must be one of: auto, centroid, "
                 "representative_point"
             )
-        overlap_policy = (args.get("overlap_policy") or "first_match").lower()
-        if overlap_policy not in ("first_match", "all_matches", "largest"):
+        overlap_policy = str(args.get("overlap_policy") or "").lower()
+        if overlap_policy and overlap_policy not in (
+            "first_match",
+            "all_matches",
+            "largest",
+        ):
             raise ToolInputError(
                 "overlap_policy must be one of: first_match, "
                 "all_matches, largest"
@@ -4460,9 +4761,10 @@ class ArcGISHubPlugin(DataPlugin):
                     f"buffer_distance must be a number "
                     f"(got {raw_buffer!r})"
                 ) from exc
-            if buffer_val < 0:
+            if not math.isfinite(buffer_val) or buffer_val < 0:
                 raise ToolInputError(
-                    f"buffer_distance must be >= 0 (got {buffer_val})"
+                    f"buffer_distance must be a finite number >= 0 "
+                    f"(got {raw_buffer!r})"
                 )
             if buffer_val > 0:
                 buffer_units_canonical = self._normalize_linear_unit(
@@ -4472,6 +4774,15 @@ class ArcGISHubPlugin(DataPlugin):
                     buffer_val
                     * self._LINEAR_UNIT_TO_METERS[buffer_units_canonical]
                 )
+        if not overlap_policy:
+            # "Within N of each polygon" is a per-polygon question: a
+            # feature in range of two polygons belongs in both rows.
+            # first_match would hand it to whichever polygon the server
+            # happened to list first -- not the nearest, and the other
+            # polygon's row would silently lose it. Without a buffer
+            # the polygons normally tile, so first_match is exact and
+            # keeps the rows summable.
+            overlap_policy = "all_matches" if buffer_m > 0 else "first_match"
         max_source = min(
             self._int_arg(args, "max_source_features", self.AGG_SOURCE_LIMIT),
             self.AGG_SOURCE_LIMIT,
@@ -4530,11 +4841,13 @@ class ArcGISHubPlugin(DataPlugin):
 
         # Reduce each source feature to a point.
         source_points: List[Tuple[Tuple[float, float], Dict[str, Any]]] = []
+        no_geometry_count = 0
         for feat in source_features:
             props = feat.get("properties") or {}
             geom = feat.get("geometry") or {}
             point = self._feature_to_point(geom, centroid_mode)
             if point is None:
+                no_geometry_count += 1
                 continue
             source_points.append((point, props))
 
@@ -4553,9 +4866,10 @@ class ArcGISHubPlugin(DataPlugin):
         first_only = overlap_policy == "first_match"
         m_per_deg = self._M_PER_DEG_LAT
         buckets: Dict[Any, Dict[str, Any]] = defaultdict(
-            lambda: {"count": 0, **{f: 0.0 for f in sum_fields}}
+            lambda: {"count": 0, "sums": {f: 0.0 for f in sum_fields}}
         )
         unmatched_count = 0
+        multi_bucket_count = 0
         for point, props in source_points:
             px, py = point
             # Buffer padding in degrees, consistent with the cos(lat)
@@ -4595,21 +4909,26 @@ class ArcGISHubPlugin(DataPlugin):
             if not matches:
                 unmatched_count += 1
                 continue
-            if overlap_policy == "first_match":
-                matches = matches[:1]
-            elif overlap_policy == "largest":
+            if overlap_policy == "largest":
                 matches = [max(matches, key=lambda p: p.get("_area", 0.0))]
-            for p in matches:
-                b = buckets[p["group"]]
+            # One feature counts once per GROUP: two polygons carrying
+            # the same group value must not add it to that bucket twice.
+            groups = list(dict.fromkeys(p["group"] for p in matches))
+            if len(groups) > 1:
+                multi_bucket_count += 1
+            for group in groups:
+                b = buckets[group]
                 b["count"] += 1
                 for fld in sum_fields:
                     v = props.get(fld)
                     if v is None:
                         continue
                     try:
-                        b[fld] = (b[fld] or 0) + float(v)
+                        num = float(v)
                     except (TypeError, ValueError):
                         continue
+                    if math.isfinite(num):
+                        b["sums"][fld] += num
 
         # Format: sorted by count desc for readability.
         bucket_list = sorted(
@@ -4678,6 +4997,10 @@ class ArcGISHubPlugin(DataPlugin):
                 fetched=len(source_features),
                 max_source=max_source,
                 agg_where=agg_where,
+                overlap_policy=overlap_policy,
+                multi_bucket_count=multi_bucket_count,
+                no_geometry_count=no_geometry_count,
+                source_geom_type=source_geom_type,
             )
             for caveat in agg_caveats:
                 lines += ["", f"_{caveat['message']}_"]
@@ -4705,7 +5028,7 @@ class ArcGISHubPlugin(DataPlugin):
                 else:
                     row.append(f"{cnt:,}")
             for fld in sum_fields:
-                val = bucket[fld]
+                val = bucket["sums"][fld]
                 if isinstance(val, float) and val.is_integer():
                     row.append(f"{int(val):,}")
                 else:
@@ -4720,6 +5043,10 @@ class ArcGISHubPlugin(DataPlugin):
             fetched=len(source_features),
             max_source=max_source,
             agg_where=agg_where,
+            overlap_policy=overlap_policy,
+            multi_bucket_count=multi_bucket_count,
+            no_geometry_count=no_geometry_count,
+            source_geom_type=source_geom_type,
         )
         # The italic notes and the structured caveats are rendered from the
         # same list, so the two can never disagree about what qualified a
@@ -4731,7 +5058,7 @@ class ArcGISHubPlugin(DataPlugin):
         for group, bucket in bucket_list:
             row: Dict[str, Any] = {
                 "group": group,
-                "sums": {f: bucket[f] for f in sum_fields},
+                "sums": dict(bucket["sums"]),
             }
             if include_count:
                 row["count"] = bucket["count"]
@@ -4758,12 +5085,77 @@ class ArcGISHubPlugin(DataPlugin):
         fetched: int,
         max_source: int,
         agg_where: str = "1=1",
+        overlap_policy: str = "first_match",
+        multi_bucket_count: int = 0,
+        no_geometry_count: int = 0,
+        source_geom_type: str = "",
     ) -> None:
         """Append the qualifications that apply to an aggregation result.
 
         Messages are plain text, not markdown: they are consumed verbatim
         by structured clients and only wrapped in italics for rendering.
         """
+        if multi_bucket_count:
+            caveats.append(
+                {
+                    "code": "counted_in_multiple_buckets",
+                    "count": multi_bucket_count,
+                    "message": (
+                        f"{multi_bucket_count:,} source feature(s) "
+                        f"matched more than one group and are counted "
+                        f"in each (overlap_policy=all_matches). Each "
+                        f"row is right on its own, but the rows "
+                        f"overlap: do NOT add them up for an overall "
+                        f"total."
+                    ),
+                }
+            )
+        if buffer_m > 0 and overlap_policy == "first_match":
+            caveats.append(
+                {
+                    "code": "first_match_with_buffer",
+                    "message": (
+                        f"With a buffer and overlap_policy=first_match, "
+                        f"a source feature within {buffer_label} of "
+                        f"several polygons is counted for ONE of them "
+                        f"only -- the first the server listed, not the "
+                        f"nearest. The overall total is right; "
+                        f"per-row figures are not 'everything within "
+                        f"{buffer_label} of this polygon'. Use "
+                        f"overlap_policy=all_matches for that."
+                    ),
+                }
+            )
+        if no_geometry_count:
+            caveats.append(
+                {
+                    "code": "source_features_without_geometry",
+                    "count": no_geometry_count,
+                    "message": (
+                        f"{no_geometry_count:,} fetched source "
+                        f"feature(s) have no usable geometry and are "
+                        f"in no bucket, nor in the source-feature or "
+                        f"unmatched counts."
+                    ),
+                }
+            )
+        if source_geom_type and "Point" not in source_geom_type:
+            what = (
+                "line" if "Polyline" in source_geom_type else "polygon"
+            )
+            caveats.append(
+                {
+                    "code": "whole_feature_assignment",
+                    "message": (
+                        f"Each source {what} is assigned WHOLE to the "
+                        f"bucket holding its "
+                        f"{'midpoint' if what == 'line' else 'interior point'}"
+                        f"; a {what} that straddles a boundary is not "
+                        f"split, so its full count and sums go to one "
+                        f"side."
+                    ),
+                }
+            )
         if small_bucket_seen:
             caveats.append(
                 {
@@ -4868,8 +5260,10 @@ class ArcGISHubPlugin(DataPlugin):
                 v = float(raw)
             except (TypeError, ValueError) as exc:
                 raise ToolInputError(f"{name} must be a number (got {raw!r})") from exc
-            if v < 0:
-                raise ToolInputError(f"{name} must be >= 0 (got {v})")
+            if not math.isfinite(v) or v < 0:
+                raise ToolInputError(
+                    f"{name} must be a finite number >= 0 (got {raw!r})"
+                )
             return v
 
         max_cov = _opt_pct("max_coverage_pct")
@@ -5053,22 +5447,36 @@ class ArcGISHubPlugin(DataPlugin):
                     p["covered"] += a
                     break
 
-        scored = [
-            {
-                "id": p["id"],
-                # Ratio of two same-projection areas, so the projection
-                # distortion cancels and the PERCENTAGE was always right
-                # even when the raw areas were not.
-                "coverage": 100.0 * p["covered"] / p["area"],
-                "covered": p["covered"],
-                "area": p["area"],
-                "covered_sqft": self._to_sqft(
-                    p["covered"], p["lat"], overlay_wkid
-                ),
-                "area_sqft": self._to_sqft(p["area"], p["lat"], target_wkid),
-            }
-            for p in parcels
-        ]
+        # The stored-area ratio is only a percentage when both layers
+        # store area in the SAME projection: then the distortion cancels.
+        # With a Web Mercator target and an equal-area overlay (or the
+        # reverse) the raw ratio is off by sec^2(latitude) -- 50% read
+        # as 11.6% at Anchorage -- so the ratio is taken from the true
+        # areas instead, when both can be had.
+        mixed_projections = target_wkid != overlay_wkid
+        mixed_uncorrected = False
+        scored = []
+        for p in parcels:
+            covered_sqft = self._to_sqft(
+                p["covered"], p["lat"], overlay_wkid
+            )
+            area_sqft = self._to_sqft(p["area"], p["lat"], target_wkid)
+            coverage = 100.0 * p["covered"] / p["area"]
+            if mixed_projections:
+                if covered_sqft is not None and area_sqft:
+                    coverage = 100.0 * covered_sqft / area_sqft
+                else:
+                    mixed_uncorrected = True
+            scored.append(
+                {
+                    "id": p["id"],
+                    "coverage": coverage,
+                    "covered": p["covered"],
+                    "area": p["area"],
+                    "covered_sqft": covered_sqft,
+                    "area_sqft": area_sqft,
+                }
+            )
         zero_cov = sum(1 for r in scored if r["coverage"] == 0.0)
 
         def in_band(c: float) -> bool:
@@ -5150,8 +5558,39 @@ class ArcGISHubPlugin(DataPlugin):
                 ),
             },
         ]
+        if mixed_uncorrected:
+            caveats.append(
+                {
+                    "code": "mixed_projections",
+                    "message": (
+                        f"The two layers store area in different "
+                        f"projections (target wkid {target_wkid}, "
+                        f"overlay wkid {overlay_wkid}) and at least one "
+                        f"cannot be converted to true area, so the "
+                        f"coverage percentages compare unlike units "
+                        f"and are NOT reliable. Use layers in the same "
+                        f"projection."
+                    ),
+                }
+            )
         _areas_corrected = bool(scored) and scored[0].get("area_sqft") is not None
-        if _areas_corrected:
+        if _areas_corrected and mixed_projections and not mixed_uncorrected:
+            caveats.append(
+                {
+                    "code": "area_units_corrected",
+                    "message": (
+                        f"Areas are reported in true square feet. The "
+                        f"two layers store {target_area_field} / "
+                        f"{overlay_area_field} in different projections "
+                        f"(target wkid {target_wkid}, overlay wkid "
+                        f"{overlay_wkid}), so each figure is converted "
+                        f"to true area at its own feature's latitude "
+                        f"and the coverage percentage is computed from "
+                        f"the converted areas."
+                    ),
+                }
+            )
+        elif _areas_corrected and not mixed_projections:
             caveats.append(
                 {
                     "code": "area_units_corrected",
@@ -5443,6 +5882,7 @@ class ArcGISHubPlugin(DataPlugin):
         # Delegate the actual spatial query to spatial_query_polygon's
         # filter-item pathway so we get server-side intersection and
         # consistent result formatting with the rest of the plugin.
+        overflow: Dict[str, Any] = {}
         records, source_meta = await asyncio.gather(
             self.spatial_query_polygon(
                 source_item_id,
@@ -5456,6 +5896,7 @@ class ArcGISHubPlugin(DataPlugin):
                 },
                 limit=effective_limit,
                 return_geometry=return_geometry,
+                info=overflow,
             ),
             self._safe_layer_meta(source_item_id),
         )
@@ -5495,9 +5936,10 @@ class ArcGISHubPlugin(DataPlugin):
         body, structured = self._format_query_results(
             records,
             effective_limit,
-            total_count=None,
+            total_count=overflow.get("total_count"),
             date_fields=source_meta.get("date_fields"),
             coded_domains=source_meta.get("coded_domains"),
+            limit_reached=bool(overflow.get("limit_reached")),
         )
         # The shared formatter does not know about the container layer;
         # add that context so the structured result explains what was
@@ -5591,7 +6033,14 @@ class ArcGISHubPlugin(DataPlugin):
 
         seen: set = set()
         values: List[Any] = []
-        for f in data.get("features", []):
+        raw_rows = data.get("features") or []
+        # Judge the cap on the rows the server sent, before NULLs and
+        # repeats are dropped: a full page holding one NULL yields
+        # limit-1 values and used to read as complete.
+        hit_cap = len(raw_rows) >= limit or bool(
+            data.get("exceededTransferLimit")
+        )
+        for f in raw_rows:
             v = (f.get("attributes") or {}).get(field)
             if v is None or v in seen:
                 continue
@@ -5648,9 +6097,7 @@ class ArcGISHubPlugin(DataPlugin):
                 )
             ), _structured([], False)
 
-        capped_note = (
-            " (truncated to limit)" if len(values) >= limit else ""
-        )
+        capped_note = " (truncated to limit)" if hit_cap else ""
         lines = [
             f"## Distinct `{field}` values "
             f"({len(values)}{capped_note}, limit={limit})"
@@ -5870,7 +6317,15 @@ class ArcGISHubPlugin(DataPlugin):
             source_url, source_where
         )
         if source_count is None:
-            source_count = 0
+            # _get_record_count returns None on ANY failure, including a
+            # source_where the layer rejects. Reading that as 0 answered
+            # "nothing matches" for what was really an error.
+            raise RuntimeError(
+                f"could not count the source features matching "
+                f"source_where {source_where!r}. Check the field names "
+                f"with get_layer_schema, or retry if the service was "
+                f"busy."
+            )
         if source_count > max_source:
             raise ToolInputError(
                 f"source layer has {source_count:,} features matching "
@@ -6109,6 +6564,21 @@ class ArcGISHubPlugin(DataPlugin):
         # Structured twin of the "Skipped" line, so structuredContent-only
         # clients also learn the qualifying count may be an undercount.
         skip_caveats: List[Dict[str, Any]] = []
+        if cls_cap_hit:
+            skip_caveats.append(
+                {
+                    "code": "classification_cap_reached",
+                    "limit": self.SPANNING_CLASSIFICATION_LIMIT,
+                    "message": (
+                        f"The classification layer fetch hit the "
+                        f"{self.SPANNING_CLASSIFICATION_LIMIT:,}-polygon "
+                        f"cap, so results are based on a partial "
+                        f"sample and the qualifying count may be an "
+                        f"undercount. Narrow classification_where, or "
+                        f"use a layer with fewer, larger polygons."
+                    ),
+                }
+            )
         if skipped_polys:
             skip_caveats.append(
                 {
@@ -6548,33 +7018,66 @@ class ArcGISHubPlugin(DataPlugin):
         }
 
     @staticmethod
-    def _int_arg(args: Dict[str, Any], name: str, default: Any = None) -> int:
+    def _int_arg(
+        args: Dict[str, Any],
+        name: str,
+        default: Any = None,
+        minimum: Optional[int] = None,
+    ) -> int:
         """Coerce a caller-supplied argument to int, or explain why not.
 
         A bare int() raises "invalid literal for int() with base 10:
         'abc'" -- which reads as a server fault in the logs and tells the
         caller nothing about which argument was wrong.
+
+        An explicit null means "use the default". Every integer argument
+        of these tools is a count or a cap, so the floor defaults to 1
+        (0 for ``layer_index``): a zero or negative limit used to reach
+        the portal and come back as a false "nothing found".
         """
-        raw = args.get(name, default)
+        raw = args.get(name)
+        if raw is None:
+            raw = default
         try:
-            return int(raw)
-        except (TypeError, ValueError) as exc:
+            if isinstance(raw, bool):
+                raise TypeError("bool is not an integer argument")
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ToolInputError(
                 f"{name} must be an integer (got {raw!r})"
             ) from exc
+        floor = minimum
+        if floor is None:
+            floor = 0 if name == "layer_index" else 1
+        if value < floor:
+            raise ToolInputError(
+                f"{name} must be at least {floor} (got {value})"
+            )
+        return value
 
     @staticmethod
     def _float_arg(
         args: Dict[str, Any], name: str, default: Any = None
     ) -> float:
-        """Coerce a caller-supplied argument to float, or explain why not."""
-        raw = args.get(name, default)
+        """Coerce a caller-supplied argument to float, or explain why not.
+
+        NaN and infinity are refused: they pass every ``< 0`` guard,
+        and a NaN in a result is not valid JSON.
+        """
+        raw = args.get(name)
+        if raw is None:
+            raw = default
         try:
-            return float(raw)
+            value = float(raw)
         except (TypeError, ValueError) as exc:
             raise ToolInputError(
                 f"{name} must be a number (got {raw!r})"
             ) from exc
+        if not math.isfinite(value):
+            raise ToolInputError(
+                f"{name} must be a finite number (got {raw!r})"
+            )
+        return value
 
     # ── Tool definitions ──────────────────────────────────────────────────
 
@@ -6673,18 +7176,21 @@ class ArcGISHubPlugin(DataPlugin):
                         "type": ["integer", "null"],
                         "minimum": 0,
                         "description": (
-                            "Records matching the WHERE clause -- the "
-                            "answer to 'how many?'. null when the tool "
-                            "does not paginate (the spatial_* tools), "
-                            "in which case `returned` is the whole set."
+                            "Records matching the query -- the "
+                            "answer to 'how many?'. The spatial tools "
+                            "report it only when the result was cut "
+                            "at `limit`; null there with `truncated` "
+                            "false means `returned` is the whole set."
                         ),
                     },
                     "truncated": {
                         "type": "boolean",
                         "description": (
-                            "True when total_count exceeds returned, so "
-                            "`rows` is a sample and must not be used for "
-                            "counts or percentages."
+                            "True when more records match than were "
+                            "returned (total_count exceeds returned, or "
+                            "a limit_reached caveat when the total is "
+                            "unknown), so `rows` is a sample and must "
+                            "not be used for counts or percentages."
                         ),
                     },
                     "complete": {
@@ -8155,12 +8661,19 @@ class ArcGISHubPlugin(DataPlugin):
                                 "largest",
                             ],
                             "description": (
-                                "How to handle source points that fall "
-                                "inside overlapping aggregation "
-                                "polygons. 'first_match' (default) is "
-                                "fastest; 'all_matches' double-counts "
-                                "but is honest; 'largest' picks the "
-                                "biggest polygon deterministically."
+                                "How to handle a source feature that "
+                                "matches several aggregation polygons. "
+                                "'first_match' counts it once, for the "
+                                "first polygon listed (rows add up to "
+                                "the total); 'all_matches' counts it "
+                                "for every polygon it matches (each "
+                                "row is complete, rows overlap); "
+                                "'largest' picks the biggest polygon. "
+                                "Default: 'first_match' without a "
+                                "buffer, 'all_matches' with "
+                                "buffer_distance, since 'within N of "
+                                "each polygon' is a per-polygon "
+                                "question."
                             ),
                             "default": "first_match",
                         },
@@ -8542,9 +9055,70 @@ class ArcGISHubPlugin(DataPlugin):
     ) -> ToolResult:
         token = _call_deadline.set(time.monotonic() + TOOL_CALL_BUDGET_S)
         try:
+            try:
+                arguments = self._clean_arguments(tool_name, arguments)
+            except ToolInputError as e:
+                logger.warning(
+                    f"Invalid arguments for tool {tool_name}: {e}",
+                    extra={
+                        "tool_name": tool_name,
+                        "error_type": type(e).__name__,
+                    },
+                )
+                return ToolResult(
+                    content=[], success=False, error_message=str(e)
+                )
             return await self._execute_tool(tool_name, arguments)
         finally:
             _call_deadline.reset(token)
+
+    def _clean_arguments(
+        self, tool_name: str, arguments: Any
+    ) -> Dict[str, Any]:
+        """Normalise caller arguments before any tool reads them.
+
+        * An explicit JSON null means "not supplied": some clients send
+          null for every optional they leave unset, and the tools read
+          arguments with ``.get(name, default)``, which a present null
+          defeats.
+        * A parameter the tool declares as a string must be a string.
+          A list of strings is joined with commas, because models
+          routinely send ``out_fields`` or ``sum_fields`` either way.
+          Anything else is the caller's mistake, said plainly, rather
+          than an AttributeError from deep inside the tool.
+        """
+        if arguments is None:
+            return {}
+        if not isinstance(arguments, dict):
+            raise ToolInputError("tool arguments must be an object")
+        if self._arg_types is None:
+            self._arg_types = {
+                t.name: {
+                    name: spec.get("type")
+                    for name, spec in (
+                        (t.input_schema or {}).get("properties") or {}
+                    ).items()
+                    if isinstance(spec, dict)
+                }
+                for t in self.get_tools()
+            }
+        declared = self._arg_types.get(tool_name, {})
+        cleaned: Dict[str, Any] = {}
+        for name, value in arguments.items():
+            if value is None:
+                continue
+            if declared.get(name) == "string" and not isinstance(value, str):
+                if isinstance(value, (list, tuple)) and all(
+                    isinstance(v, str) for v in value
+                ):
+                    value = ",".join(value)
+                else:
+                    raise ToolInputError(
+                        f"{name} must be a string "
+                        f"(got {type(value).__name__})"
+                    )
+            cleaned[name] = value
+        return cleaned
 
     async def _execute_tool(
         self, tool_name: str, arguments: Dict[str, Any]
@@ -8709,7 +9283,6 @@ class ArcGISHubPlugin(DataPlugin):
                     else None
                 )
 
-                _assessor_banner = self._query_result_banner(item_id)
                 text, structured = self._format_query_results(
                     records,
                     effective_limit,
@@ -8732,11 +9305,7 @@ class ArcGISHubPlugin(DataPlugin):
                 )
                 if not records:
                     text += self._no_data_hint(where)
-                if _assessor_banner:
-                    # Front of the response: these traps change how the
-                    # numbers below must be read, so they are useless
-                    # appended after the data.
-                    text = _assessor_banner + "\n\n" + text
+                text = self._apply_result_banner(item_id, text, structured)
 
             elif tool_name == "spatial_query_point":
                 item_id = arguments.get("item_id", "").strip()
@@ -8753,6 +9322,7 @@ class ArcGISHubPlugin(DataPlugin):
                         error_message="lon and lat are required",
                     )
                 limit = min(self._int_arg(arguments, "limit", 10), 50)
+                overflow: Dict[str, Any] = {}
                 records, layer_meta = await asyncio.gather(
                     self.spatial_query_point(
                         item_id,
@@ -8763,6 +9333,7 @@ class ArcGISHubPlugin(DataPlugin):
                             "out_fields": arguments.get("out_fields", "*"),
                         },
                         limit=limit,
+                        info=overflow,
                     ),
                     self._safe_layer_meta(item_id),
                 )
@@ -8783,19 +9354,32 @@ class ArcGISHubPlugin(DataPlugin):
                         limit=limit,
                     )
                 else:
-                    # total_count=None avoids a misleading "of N total"
-                    # line: every match is already in `records`, there
-                    # is no paging going on. layer_meta is best-effort;
-                    # raw rendering falls through on any failure.
+                    # total_count stays None when every match is in
+                    # `records` (no "of N total" line for the ordinary
+                    # answer); spatial_query_point supplies a count
+                    # only when the page was cut at `limit`.
+                    # layer_meta is best-effort; raw rendering falls
+                    # through on any failure.
                     text, structured = self._format_query_results(
                         records,
                         limit,
-                        total_count=None,
+                        total_count=overflow.get("total_count"),
                         date_fields=layer_meta.get("date_fields"),
                         coded_domains=layer_meta.get("coded_domains"),
                         last_edit_date=layer_meta.get("last_edit_date"),
                         coverage_pct=layer_meta.get("coverage_pct"),
+                        limit_reached=bool(
+                            overflow.get("limit_reached")
+                        ),
                     )
+                    structured["query"].update(
+                        {
+                            "item_id": item_id,
+                            "where": arguments.get("where"),
+                            "out_fields": arguments.get("out_fields"),
+                        }
+                    )
+                text = self._apply_result_banner(item_id, text, structured)
 
             elif tool_name == "spatial_query_polygon":
                 item_id = arguments.get("item_id", "").strip()
@@ -8828,6 +9412,7 @@ class ArcGISHubPlugin(DataPlugin):
                     if return_geometry
                     else min(requested_limit, 1000)
                 )
+                overflow = {}
                 records, layer_meta = await asyncio.gather(
                     self.spatial_query_polygon(
                         item_id,
@@ -8843,6 +9428,7 @@ class ArcGISHubPlugin(DataPlugin):
                         return_geometry=return_geometry,
                         distance=arguments.get("distance"),
                         units=arguments.get("units", "meters"),
+                        info=overflow,
                     ),
                     self._safe_layer_meta(item_id),
                 )
@@ -8875,12 +9461,23 @@ class ArcGISHubPlugin(DataPlugin):
                     text, structured = self._format_query_results(
                         records,
                         effective_limit,
-                        total_count=None,
+                        total_count=overflow.get("total_count"),
                         date_fields=date_fields,
                         coded_domains=coded_domains,
                         last_edit_date=layer_meta.get("last_edit_date"),
                         coverage_pct=layer_meta.get("coverage_pct"),
+                        limit_reached=bool(
+                            overflow.get("limit_reached")
+                        ),
                     )
+                    structured["query"].update(
+                        {
+                            "item_id": item_id,
+                            "where": arguments.get("where"),
+                            "out_fields": arguments.get("out_fields"),
+                        }
+                    )
+                text = self._apply_result_banner(item_id, text, structured)
 
             elif tool_name == "aggregate_by_polygon":
                 text, structured = await self._aggregate_by_polygon(arguments)
@@ -8890,6 +9487,11 @@ class ArcGISHubPlugin(DataPlugin):
 
             elif tool_name == "filter_by_polygon":
                 text, structured = await self._filter_by_polygon(arguments)
+                text = self._apply_result_banner(
+                    str(arguments.get("source_item_id") or "").strip(),
+                    text,
+                    structured,
+                )
 
             elif tool_name == "find_features_spanning_classifications":
                 (

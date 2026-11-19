@@ -44,10 +44,26 @@ class WhereValidator:
         "/*",
         "*/",
         "@@",
-        "xp_",
-        "sp_",
-        "0x",
     ]
+
+    # Tokens that are only suspicious at the START of a word: the
+    # SQL Server procedure prefixes and a hex literal. Matched as bare
+    # substrings they refused ordinary field names -- INSP_DATE,
+    # EXP_DATE and Disp_Code all contain "sp_" or "xp_".
+    FORBIDDEN_PREFIXES = [
+        (re.compile(r"\bxp_", re.IGNORECASE), "xp_"),
+        (re.compile(r"\bsp_", re.IGNORECASE), "sp_"),
+        (re.compile(r"\b0x[0-9a-f]", re.IGNORECASE), "0x"),
+    ]
+
+    # EXTRACT(<unit> FROM <field>) is standard ArcGIS SQL and the only
+    # legitimate FROM in a WHERE clause; it is blanked before the
+    # keyword scan so the scan still refuses every other FROM.
+    _EXTRACT_FROM_RE = re.compile(
+        r"\bEXTRACT\s*\(\s*"
+        r"(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND)\s+FROM\b",
+        re.IGNORECASE,
+    )
 
     MAX_LENGTH = 2000
 
@@ -99,8 +115,13 @@ class WhereValidator:
                 outside of quoted string literals, or an unbalanced
                 quote.
         """
-        if not where:
+        if where is None or where == "":
             return "1=1"
+        if not isinstance(where, str):
+            raise ToolInputError(
+                f"WHERE clause must be a string "
+                f"(got {type(where).__name__})"
+            )
 
         where = where.strip()
         if not where:
@@ -121,8 +142,16 @@ class WhereValidator:
                 raise ToolInputError(
                     f"Forbidden substring {bad!r} detected in WHERE clause"
                 )
+        for pattern, label in cls.FORBIDDEN_PREFIXES:
+            if pattern.search(masked):
+                raise ToolInputError(
+                    f"Forbidden substring {label!r} detected in WHERE "
+                    f"clause"
+                )
 
-        masked_upper = masked.upper()
+        masked_upper = cls._EXTRACT_FROM_RE.sub(
+            "EXTRACT(", masked
+        ).upper()
         for keyword in cls.FORBIDDEN_KEYWORDS:
             if re.search(rf"\b{keyword}\b", masked_upper):
                 raise ToolInputError(
@@ -139,8 +168,9 @@ class WhereValidator:
         {
             "AND", "OR", "NOT", "BETWEEN", "IN", "LIKE", "ESCAPE", "IS",
             "NULL", "TRUE", "FALSE",
-            "DATE", "TIMESTAMP", "TIME",
-            "CURRENT_DATE", "CURRENT_TIMESTAMP",
+            "DATE", "TIMESTAMP", "TIME", "INTERVAL", "FROM",
+            "CURRENT_DATE", "CURRENT_TIMESTAMP", "CURRENT_TIME",
+            "MOD", "POWER", "CHAR_LENGTH", "CONCAT",
             "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND",
             "CASE", "WHEN", "THEN", "ELSE", "END",
             "UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM",
@@ -252,6 +282,15 @@ class OutFieldsValidator:
     def validate(cls, out_fields: str) -> str:
         if out_fields is None:
             return "*"
+        if isinstance(out_fields, (list, tuple)) and all(
+            isinstance(f, str) for f in out_fields
+        ):
+            out_fields = ",".join(out_fields)
+        if not isinstance(out_fields, str):
+            raise ToolInputError(
+                f"out_fields must be a comma-separated string "
+                f"(got {type(out_fields).__name__})"
+            )
         value = out_fields.strip()
         if not value or value == "*":
             return "*"
@@ -285,6 +324,11 @@ class OrderByValidator:
     def validate(cls, order_by: str) -> str:
         if not order_by:
             return ""
+        if not isinstance(order_by, str):
+            raise ToolInputError(
+                f"order_by must be a string "
+                f"(got {type(order_by).__name__})"
+            )
         value = order_by.strip()
         if not value:
             return ""

@@ -146,7 +146,23 @@ class TestGalleryGroups:
         p._run_search = AsyncMock(return_value=[])
         await p._search_gallery("trails", 5)
         assert p._run_search.await_args.args[0] == (
-            f"group:{GROUP_A} AND trails"
+            f"group:{GROUP_A} AND (trails)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_or_in_the_topic_stays_inside_the_group(self):
+        """Bare, `group:X AND parks OR trails` matched every item about
+        trails, in the gallery group or not (104 vs 9 on a live portal).
+        The caller's own parentheses must not be able to undo that."""
+        p = _example()
+        p._run_search = AsyncMock(return_value=[])
+        await p._search_gallery("parks OR trails", 5)
+        assert p._run_search.await_args.args[0] == (
+            f"group:{GROUP_A} AND (parks OR trails)"
+        )
+        await p._search_gallery("parks) OR (title:x", 5)
+        assert p._run_search.await_args.args[0] == (
+            f"group:{GROUP_A} AND (parks  OR  title:x)"
         )
 
     @pytest.mark.asyncio
@@ -175,7 +191,7 @@ class TestPartnerOrgs:
         p._run_search = AsyncMock(return_value=[])
         await p._search_org_layers("roads", ["Feature Service"], 5)
         assert p._run_search.await_args.args[0] == (
-            f'orgid:{ORG} AND (type:"Feature Service") AND roads'
+            f'orgid:{ORG} AND (type:"Feature Service") AND (roads)'
         )
 
     @pytest.mark.asyncio

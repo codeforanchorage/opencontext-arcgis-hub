@@ -6,7 +6,8 @@ carried the same validator before it became part of this package.
 
 import pytest
 
-from arcgis_hub.where_validator import WhereValidator
+from core.interfaces import ToolInputError
+from arcgis_hub.where_validator import OutFieldsValidator, WhereValidator
 
 
 class TestWhereValidator:
@@ -138,3 +139,61 @@ class TestWhereValidatorAgainstSchema:
         WhereValidator.validate_against_schema(
             "UPPER(STATUS)='ACTIVE'", {"STATUS"}
         )
+
+
+class TestFieldNamesThatLookLikeAttacks:
+    """Blocklist tokens matched as bare substrings refused real fields."""
+
+    @pytest.mark.parametrize(
+        "where",
+        [
+            "INSP_DATE > DATE '2024-01-01'",
+            "EXP_DATE IS NOT NULL",
+            "Disp_Code = 'A'",
+            "Box0x = 1",
+            "EXTRACT(YEAR FROM INSP_DATE) = 2024",
+            "extract( month from INSP_DATE ) = 6",
+        ],
+    )
+    def test_accepted(self, where):
+        assert WhereValidator.validate(where) == where
+
+    @pytest.mark.parametrize(
+        "where",
+        [
+            "1=1 OR xp_cmdshell('dir') = 1",
+            "sp_executesql = 1",
+            "OBJECTID = 0x1F",
+            "NAME = (SELECT 1 FROM t)",
+            "OBJECTID IN (1) FROM t",
+            "EXTRACT(YEAR FROM d) = 1 FROM t",
+        ],
+    )
+    def test_still_refused(self, where):
+        with pytest.raises(ToolInputError):
+            WhereValidator.validate(where)
+
+    @pytest.mark.parametrize("bad", [5, ["a"], {"a": 1}])
+    def test_non_string_is_a_caller_error(self, bad):
+        with pytest.raises(ToolInputError, match="must be a string"):
+            WhereValidator.validate(bad)
+
+    @pytest.mark.parametrize(
+        "where",
+        [
+            "EXTRACT(YEAR FROM INSP_DATE) = 2024",
+            "INSP_DATE > CURRENT_TIMESTAMP - INTERVAL '7' DAY",
+            "MOD(OBJECTID, 2) = 0",
+            "CHAR_LENGTH(NAME) > 3",
+        ],
+    )
+    def test_standard_functions_are_not_read_as_fields(self, where):
+        WhereValidator.validate_against_schema(
+            WhereValidator.validate(where),
+            ["INSP_DATE", "OBJECTID", "NAME"],
+        )
+
+    def test_out_fields_accepts_a_list(self):
+        assert OutFieldsValidator.validate(["A", "B"]) == "A,B"
+        with pytest.raises(ToolInputError):
+            OutFieldsValidator.validate(5)

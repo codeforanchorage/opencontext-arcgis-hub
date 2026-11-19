@@ -28,7 +28,7 @@ Used by: Anchorage GIS (`anchorage-gis-mcp`) and the Alaska Geoportal
 Pin a tag in `requirements.txt` and `pyproject.toml`:
 
 ```
-opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.0.0
+opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.1.0
 ```
 
 Then subclass in `plugins/<name>/plugin.py`:
@@ -111,6 +111,47 @@ Do not run `ruff format` across the repo; the source is hand-wrapped and
 not format-clean.
 
 ## Releases
+
+**1.1.0** — results that were wrong or partial without saying so, from
+a review of 1.0.0. Three changes are visible to callers and are why this
+is a minor release:
+
+- `aggregate_by_polygon` with `buffer_distance` now defaults to
+  `overlap_policy=all_matches`: a feature within range of several
+  polygons is counted for each (rows overlap, and a caveat says so).
+  `first_match` gave it to whichever polygon the server listed first.
+- An aggregation layer with 5,000 or more matching polygons is refused
+  instead of being cut to the first 5,000.
+- A `limit` (or other count) of zero or below is an error, not a false
+  "nothing found".
+
+Also fixed:
+
+- `spatial_query_point`, `spatial_query_polygon` and `filter_by_polygon`
+  report the real total and `truncated: true` when cut at `limit`.
+- Paged fetches follow `exceededTransferLimit`, so a layer whose
+  `maxRecordCount` is under the page size is read to the end.
+- The centroid of a small polygon is computed about a local origin; on
+  raw lon/lat a 10 m square's centroid landed a block away.
+- Service URLs with `.`/`..` segments, a query string, or a
+  non-service path on the portal host are refused (the first walked out
+  of the organisation allowlist).
+- NaN and infinity are refused for numeric arguments; an explicit null
+  means "not supplied"; a wrong-typed string argument is named.
+- A layer banner (`_query_result_banner`) reaches the structured result
+  as a `layer_notes` caveat, for every record-returning tool.
+- A caller's search text is parenthesised, so an `OR` in it cannot
+  escape the group / organisation / item-type scope.
+- `coverage_by_polygon` computes the percentage from true areas when
+  the two layers are in different projections.
+- `get_distinct_values`, the spanning tool's cap notice and failed
+  count, `search_layers_by_field`'s unread services, inline
+  MultiPolygon filters, sums over duplicate fields or a field named
+  `count`, and source features without geometry: each now says what
+  happened.
+- The WHERE validator no longer refuses field names that merely contain
+  `sp_` / `xp_` (`INSP_DATE`, `EXP_DATE`), and accepts
+  `EXTRACT(YEAR FROM field)`.
 
 **1.0.0** — extracted from the Anchorage GIS deployment
 (`anchorage-gis-mcp` at `7897032`), generalised with the Alaska
