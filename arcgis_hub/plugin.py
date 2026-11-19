@@ -3640,6 +3640,37 @@ class ArcGISHubPlugin(DataPlugin):
     # only ~half a degree of latitude in ground distance.
     _M_PER_DEG_LAT = 111195.0
 
+    @staticmethod
+    def _lon_delta(lon: float, origin: float) -> float:
+        """``lon - origin`` in degrees, the short way round the globe."""
+        d = lon - origin
+        if -180.0 <= d <= 180.0:
+            return d
+        return (d + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _bbox_excludes(
+        bbox: Tuple[float, float, float, float],
+        px: float,
+        py: float,
+        pad_lon: float = 0.0,
+        pad_lat: float = 0.0,
+    ) -> bool:
+        """True when (px, py) cannot be within the padded bounding box.
+
+        With padding (a buffer) the point is also tried one turn east
+        and west, so a box that ends at the antimeridian still admits a
+        point just across it.
+        """
+        if py < bbox[1] - pad_lat or py > bbox[3] + pad_lat:
+            return True
+        lo, hi = bbox[0] - pad_lon, bbox[2] + pad_lon
+        if lo <= px <= hi:
+            return False
+        if pad_lon > 0.0:
+            return not (lo <= px + 360.0 <= hi or lo <= px - 360.0 <= hi)
+        return True
+
     @classmethod
     def _point_segment_distance_m(
         cls,
@@ -3656,9 +3687,13 @@ class ArcGISHubPlugin(DataPlugin):
         is used for.
         """
         px, py = point
-        ax = (a[0] - px) * cls._M_PER_DEG_LAT * lat_scale
+        # Longitude differences are taken the short way round. ArcGIS
+        # cuts geometry at +/-180, so a point at 179.9 and a shoreline
+        # at -179.9 are 0.2 degrees apart, not 359.8: without this a
+        # buffer never reached across the line (western Aleutians).
+        ax = cls._lon_delta(a[0], px) * cls._M_PER_DEG_LAT * lat_scale
         ay = (a[1] - py) * cls._M_PER_DEG_LAT
-        bx = (b[0] - px) * cls._M_PER_DEG_LAT * lat_scale
+        bx = cls._lon_delta(b[0], px) * cls._M_PER_DEG_LAT * lat_scale
         by = (b[1] - py) * cls._M_PER_DEG_LAT
         dx = bx - ax
         dy = by - ay
@@ -3961,14 +3996,26 @@ class ArcGISHubPlugin(DataPlugin):
         if gtype == "MultiPolygon":
             if not coords:
                 return None
-            sum_x = 0.0
-            sum_y = 0.0
-            sum_a = 0.0
+            # Parts on both sides of the antimeridian (ArcGIS cuts
+            # geometry at +/-180): average the part centroids with the
+            # western ones moved a turn east, or islands at 179 and
+            # -179 average to longitude 0, in the Atlantic.
+            centroids = []
             for poly in coords:
                 if not poly:
                     continue
-                area = cls._polygon_area(poly)
                 cx, cy = cls._ring_centroid(poly[0])
+                centroids.append((cx, cy, cls._polygon_area(poly)))
+            if not centroids:
+                return None
+            lons = [c[0] for c in centroids]
+            shift = max(lons) - min(lons) > 180.0
+            sum_x = 0.0
+            sum_y = 0.0
+            sum_a = 0.0
+            for cx, cy, area in centroids:
+                if shift and cx < 0.0:
+                    cx += 360.0
                 sum_x += cx * area
                 sum_y += cy * area
                 sum_a += area
@@ -3976,7 +4023,10 @@ class ArcGISHubPlugin(DataPlugin):
                 # Fall back to centroid of largest polygon
                 largest = max(coords, key=lambda p: cls._polygon_area(p))
                 return cls._ring_centroid(largest[0]) if largest else None
-            return (sum_x / sum_a, sum_y / sum_a)
+            x = sum_x / sum_a
+            if x > 180.0:
+                x -= 360.0
+            return (x, sum_y / sum_a)
         return None
 
     @classmethod
@@ -4164,9 +4214,7 @@ class ArcGISHubPlugin(DataPlugin):
         """Length-weighted centroid of a MultiLineString."""
         if not lines:
             return None
-        sum_x = 0.0
-        sum_y = 0.0
-        sum_len = 0.0
+        parts = []
         for line in lines:
             seg_total = cls._polyline_total_length(line)
             if seg_total == 0:
@@ -4174,15 +4222,28 @@ class ArcGISHubPlugin(DataPlugin):
             c = cls._polyline_centroid(line)
             if c is None:
                 continue
-            sum_x += c[0] * seg_total
-            sum_y += c[1] * seg_total
-            sum_len += seg_total
-        if sum_len == 0:
+            parts.append((c[0], c[1], seg_total))
+        if not parts:
             for line in lines:
                 if line:
                     return (float(line[0][0]), float(line[0][1]))
             return None
-        return (sum_x / sum_len, sum_y / sum_len)
+        # Same antimeridian handling as _geometry_centroid.
+        lons = [c[0] for c in parts]
+        shift = max(lons) - min(lons) > 180.0
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_len = 0.0
+        for cx, cy, seg_total in parts:
+            if shift and cx < 0.0:
+                cx += 360.0
+            sum_x += cx * seg_total
+            sum_y += cy * seg_total
+            sum_len += seg_total
+        x = sum_x / sum_len
+        if x > 180.0:
+            x -= 360.0
+        return (x, sum_y / sum_len)
 
     @classmethod
     def _feature_to_point(
@@ -4250,6 +4311,31 @@ class ArcGISHubPlugin(DataPlugin):
         url = self._ensure_layer_url(url)
         self._validate_service_url(url)
         return url
+
+    _OID_FALLBACK_NAMES = ("OBJECTID", "OID", "FID")
+
+    @staticmethod
+    def _oid_field_name(meta: Any) -> Optional[str]:
+        """The object-id field a layer (or a query response) declares.
+
+        It is usually OBJECTID, but not always: ObjectId, OBJECTID_1,
+        FID and ESRI_OID are all in use, and code that assumed the
+        usual name lost the join between a feature and its attributes.
+        """
+        if not isinstance(meta, dict):
+            return None
+        for key in ("objectIdField", "objectIdFieldName"):
+            name = meta.get(key)
+            if isinstance(name, str) and name:
+                return name
+        for f in meta.get("fields") or []:
+            if (
+                isinstance(f, dict)
+                and f.get("type") == "esriFieldTypeOID"
+                and f.get("name")
+            ):
+                return f["name"]
+        return None
 
     async def _fetch_layer_meta(
         self, layer_url: str, require_fields: Tuple[str, ...] = ()
@@ -4930,11 +5016,8 @@ class ArcGISHubPlugin(DataPlugin):
             matches = []
             for p in agg_polygons:
                 bb = p["_bbox"]
-                if bb is not None and (
-                    px < bb[0] - pad_lon
-                    or px > bb[2] + pad_lon
-                    or py < bb[1] - pad_lat
-                    or py > bb[3] + pad_lat
+                if bb is not None and self._bbox_excludes(
+                    bb, px, py, pad_lon, pad_lat
                 ):
                     continue
                 if buffer_m > 0:
@@ -5262,6 +5345,68 @@ class ArcGISHubPlugin(DataPlugin):
         "esriFieldTypeOID",
     })
 
+    def _coverage_batches(
+        self, parcels: List[Dict[str, Any]]
+    ) -> List[Tuple[List[Dict[str, Any]], List[Any]]]:
+        """Group targets into overlay queries that fit the filter caps.
+
+        Returns (targets, MultiPolygon coordinates) per query. A fixed
+        50 targets per query ran into MAX_FILTER_COORDS / _RINGS when
+        the targets were detailed (shorelines, large tracts), and the
+        call then failed with "filter_geometry has N coordinates" --
+        about an argument the caller never passed. Batches now close
+        when the next target would cross a cap. A single target over a
+        cap on its own is queried by its bounding box instead: a
+        superset is harmless here, because overlay features are
+        assigned to targets afterwards, by containment.
+        """
+        max_coords = self.MAX_FILTER_COORDS
+        max_rings = self.MAX_FILTER_RINGS
+        batches: List[Tuple[List[Dict[str, Any]], List[Any]]] = []
+        cur: List[Dict[str, Any]] = []
+        cur_polys: List[Any] = []
+        cur_coords = cur_rings = 0
+
+        def flush() -> None:
+            nonlocal cur, cur_polys, cur_coords, cur_rings
+            if cur:
+                batches.append((cur, cur_polys))
+            cur, cur_polys, cur_coords, cur_rings = [], [], 0, 0
+
+        for p in parcels:
+            g = p["geom"]
+            if g.get("type") == "Polygon":
+                polys = [g.get("coordinates") or []]
+            elif g.get("type") == "MultiPolygon":
+                polys = list(g.get("coordinates") or [])
+            else:
+                polys = []
+            rings = sum(len(poly) for poly in polys)
+            coords = sum(len(r) for poly in polys for r in poly)
+            if coords > max_coords or rings > max_rings:
+                bb = p["bbox"]
+                if bb is None:
+                    continue
+                flush()
+                box = [
+                    [bb[0], bb[1]], [bb[2], bb[1]], [bb[2], bb[3]],
+                    [bb[0], bb[3]], [bb[0], bb[1]],
+                ]
+                batches.append(([p], [[box]]))
+                continue
+            if cur and (
+                len(cur) >= self.COVERAGE_TARGET_BATCH
+                or cur_coords + coords > max_coords
+                or cur_rings + rings > max_rings
+            ):
+                flush()
+            cur.append(p)
+            cur_polys.extend(polys)
+            cur_coords += coords
+            cur_rings += rings
+        flush()
+        return batches
+
     async def _coverage_by_polygon(
         self, args: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
@@ -5418,16 +5563,7 @@ class ArcGISHubPlugin(DataPlugin):
         overlay_truncated = False
         seen_overlay: set = set()
         overlay_pts: List[Tuple[Tuple[float, float], float]] = []
-        batch_size = self.COVERAGE_TARGET_BATCH
-        for i in range(0, len(parcels), batch_size):
-            batch = parcels[i:i + batch_size]
-            multi_coords: List[Any] = []
-            for p in batch:
-                g = p["geom"]
-                if g.get("type") == "Polygon":
-                    multi_coords.append(g.get("coordinates") or [])
-                elif g.get("type") == "MultiPolygon":
-                    multi_coords.extend(g.get("coordinates") or [])
+        for batch, multi_coords in self._coverage_batches(parcels):
             esri = self._geojson_to_esri_polygon(
                 {"type": "MultiPolygon", "coordinates": multi_coords}
             )
@@ -5475,12 +5611,20 @@ class ArcGISHubPlugin(DataPlugin):
                     continue
                 overlay_pts.append((pt, a))
 
-        # Assign each overlay feature to the target whose polygon contains its
-        # centroid (bbox prefilter), summing overlay area. Centroid assignment
-        # gives each footprint to exactly one parcel (no double-count).
+        # Assign each overlay feature to EVERY target whose polygon
+        # contains its centroid (bbox prefilter), summing overlay area.
+        # Targets that tile the ground (lots, tracts) can only contain a
+        # given centroid once, so each footprint still lands on one of
+        # them. Targets that are stacked on each other -- the units of a
+        # condominium sharing one polygon, a lease record over its
+        # parcel -- each get it: the loop used to stop at the first
+        # match, which left every other record in the stack reading 0%,
+        # i.e. as vacant land.
+        stacked_ids: set = set()
         for i, (pt, a) in enumerate(overlay_pts):
             self._check_budget(i, 200)
             px, py = pt
+            holders = []
             for p in parcels:
                 bb = p["bbox"]
                 if bb is not None and (
@@ -5489,7 +5633,10 @@ class ArcGISHubPlugin(DataPlugin):
                     continue
                 if self._geometry_contains_point(p["geom"], pt):
                     p["covered"] += a
-                    break
+                    holders.append(p)
+            if len(holders) > 1:
+                stacked_ids.update(id(p) for p in holders)
+        stacked_targets = len(stacked_ids)
 
         # The stored-area ratio is only a percentage when both layers
         # store area in the SAME projection: then the distortion cancels.
@@ -5688,6 +5835,22 @@ class ArcGISHubPlugin(DataPlugin):
                         f"{self.COVERAGE_OVERLAY_LIMIT:,}-feature fetch cap; "
                         f"coverage for some targets may be undercounted. "
                         f"Narrow target_where."
+                    ),
+                }
+            )
+        if stacked_targets:
+            caveats.append(
+                {
+                    "code": "stacked_targets",
+                    "count": stacked_targets,
+                    "message": (
+                        f"{stacked_targets:,} target(s) lie on top of "
+                        f"one another (condominium units sharing a "
+                        f"polygon, lease or economic records over a "
+                        f"parcel). Each is credited with the overlay "
+                        f"features on its ground, so the same building "
+                        f"counts toward several of them: do not add "
+                        f"their covered areas together."
                     ),
                 }
             )
@@ -6315,8 +6478,12 @@ class ArcGISHubPlugin(DataPlugin):
         # (zoning districts, council areas) as source produces output
         # that lists OBJECTIDs as "parcel numbers" -- the exact bug
         # the user keeps hitting.
+        src_meta = await self._fetch_layer_meta(source_url)
+        oid_field = self._oid_field_name(src_meta)
+        oid_names = set(self._OID_FALLBACK_NAMES)
+        if oid_field:
+            oid_names.add(oid_field)
         if out_fields == "*":
-            src_meta = await self._fetch_layer_meta(source_url)
             src_field_names = {
                 f.get("name") for f in src_meta.get("fields", [])
             }
@@ -6329,7 +6496,7 @@ class ArcGISHubPlugin(DataPlugin):
                     f for f in sorted(src_field_names)
                     if f
                     and not f.startswith("Shape__")
-                    and f not in ("OBJECTID", "OID", "FID")
+                    and f not in oid_names
                 ][:12]
                 raise ToolInputError(
                     f"source_item_id `{source_item_id}` has no "
@@ -6754,12 +6921,23 @@ class ArcGISHubPlugin(DataPlugin):
         # combined with where + outFields, and the upstream silently
         # truncated to zero features. POST sends the same params in
         # the body and is unaffected.
+        # The object-id field must come back even when the caller
+        # narrowed out_fields: it is the only thing that ties a returned
+        # row to its value set. Without it nothing joined, and every
+        # row was then re-fetched one request at a time.
+        fetch_fields = out_fields
+        if (
+            oid_field
+            and fetch_fields != "*"
+            and oid_field not in fetch_fields.split(",")
+        ):
+            fetch_fields = f"{fetch_fields},{oid_field}"
         attrs_resp = await self._send("post",
             f"{source_url}/query",
             data={
                 "where": source_where,
                 "objectIds": ",".join(map(str, qualifying_oids)),
-                "outFields": out_fields,
+                "outFields": fetch_fields,
                 "returnGeometry": "false",
                 "f": "json",
             },
@@ -6777,16 +6955,33 @@ class ArcGISHubPlugin(DataPlugin):
                 has_where=source_where != "1=1",
             )
 
-        # Index by OID for join with the value sets. ArcGIS layers may
-        # name the OID field OBJECTID, OID, or FID -- try all three.
+        # Index by object id for the join with the value sets, under
+        # the name the response or the layer declares, then the usual
+        # names. `is not None`, not truthiness: object id 0 is real
+        # (shapefile-backed layers number from 0).
+        join_names = [
+            n
+            for n in dict.fromkeys(
+                (
+                    self._oid_field_name(attrs_data),
+                    oid_field,
+                    *self._OID_FALLBACK_NAMES,
+                )
+            )
+            if n
+        ]
+        oid_names.update(join_names)
         features_by_oid: Dict[Any, Dict[str, Any]] = {}
         if not attrs_error:
             for f in attrs_data.get("features", []):
                 attrs = f.get("attributes") or {}
-                oid = (
-                    attrs.get("OBJECTID")
-                    or attrs.get("OID")
-                    or attrs.get("FID")
+                oid = next(
+                    (
+                        attrs[n]
+                        for n in join_names
+                        if attrs.get(n) is not None
+                    ),
+                    None,
                 )
                 if oid is not None:
                     features_by_oid[oid] = attrs
@@ -6807,10 +7002,11 @@ class ArcGISHubPlugin(DataPlugin):
             async def fetch_one_oid(oid: Any) -> None:
                 # AND with source_where so the fallback honors the
                 # same predicate as the bulk path.
+                oid_col = oid_field or "OBJECTID"
                 if source_where and source_where != "1=1":
-                    where_one = f"({source_where}) AND OBJECTID={oid}"
+                    where_one = f"({source_where}) AND {oid_col}={oid}"
                 else:
-                    where_one = f"OBJECTID={oid}"
+                    where_one = f"{oid_col}={oid}"
                 where_one = WhereValidator.validate(where_one)
                 async with fallback_sem:
                     try:
@@ -6982,7 +7178,7 @@ class ArcGISHubPlugin(DataPlugin):
                     + ", ".join(f"`{v}`" for v in vals)
                 )
             for k, v in attrs.items():
-                if k in ("OBJECTID", "OID", "FID"):
+                if k in oid_names:
                     continue
                 lines.append(f"  {k}: {v}")
             lines.append("")
@@ -7035,7 +7231,7 @@ class ArcGISHubPlugin(DataPlugin):
                         {
                             k: v
                             for k, v in attrs.items()
-                            if k not in ("OBJECTID", "OID", "FID")
+                            if k not in oid_names
                         }
                         if attrs
                         else None

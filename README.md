@@ -28,7 +28,7 @@ Used by: Anchorage GIS (`anchorage-gis-mcp`) and the Alaska Geoportal
 Pin a tag in `requirements.txt` and `pyproject.toml`:
 
 ```
-opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.1.1
+opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.2.0
 ```
 
 Then subclass in `plugins/<name>/plugin.py`:
@@ -111,6 +111,26 @@ Do not run `ruff format` across the repo; the source is hand-wrapped and
 not format-clean.
 
 ## Releases
+
+**1.2.0** — four more findings from the same review. The first changes
+numbers callers see, which is why this is a minor release:
+
+- `coverage_by_polygon` credits an overlay feature to every target
+  whose polygon contains it. It stopped at the first, so of records
+  stacked on the same ground (the units of a condominium, a lease
+  record over its parcel) all but one read 0% covered. Targets that
+  tile are unaffected. A `stacked_targets` caveat says when it applies.
+- `coverage_by_polygon` sizes its overlay queries by geometry. Fifty
+  detailed targets could exceed the filter caps and fail the call with
+  an error about a `filter_geometry` the caller never passed. A single
+  target over the cap is queried by its bounding box.
+- `find_features_spanning_classifications` joins rows on the layer's
+  own object-id field, whatever it is called, fetches that field even
+  when `out_fields` is narrowed (it used to re-fetch every row one
+  request at a time), and treats object id 0 as a row.
+- Longitude differences are taken the short way round at the
+  antimeridian: a buffer reaches across +/-180, and the centroid of a
+  geometry with parts on both sides stays between them.
 
 **1.1.1** — the per-call time budget is a real deadline.
 
