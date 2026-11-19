@@ -7,6 +7,7 @@ caller as a bare "Tool execution failed", and a retried timeout (3 x 20s)
 could outlive the 28s Lambda and come back as an opaque 502.
 """
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, Mock
 
@@ -185,6 +186,86 @@ class TestRequestTimeout:
         plugin.client.get = AsyncMock(return_value=_resp({}))
         await plugin._send("get", LAYER, timeout=10.0)
         assert 0 < plugin.client.get.call_args.kwargs["timeout"] <= 5
+
+
+class TestHardDeadline:
+    """The budget is a wall-clock limit, not only a per-phase timeout."""
+
+    @pytest.mark.asyncio
+    async def test_slow_drip_response_is_cut_at_the_deadline(
+        self, plugin, deadline
+    ):
+        # httpx's timeout bounds each read, so a response that trickles
+        # in never trips it; stand in for that with a call that simply
+        # takes longer than the budget has left.
+        deadline(0.05)
+
+        async def trickle(*a, **k):
+            await asyncio.sleep(5)
+            return _resp({})
+
+        plugin.client.get = trickle
+        started = time.monotonic()
+        with pytest.raises(UpstreamTimeoutError, match="budget"):
+            await plugin._send("get", LAYER)
+        assert time.monotonic() - started < 2
+
+    @pytest.mark.asyncio
+    async def test_slow_drip_is_not_retried(self, plugin, deadline):
+        deadline(0.05)
+        calls = 0
+
+        async def trickle(*a, **k):
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(5)
+
+        plugin.client.post = trickle
+        with pytest.raises(UpstreamTimeoutError):
+            await plugin._request_json_with_retry(
+                f"{LAYER}/query", method="post", data={}
+            )
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_no_deadline_means_no_wall_clock_limit(self, plugin):
+        plugin.client.get = AsyncMock(return_value=_resp({"ok": 1}))
+        r = await plugin._send("get", LAYER)
+        assert r.json() == {"ok": 1}
+
+    @pytest.mark.asyncio
+    async def test_other_timeout_errors_are_not_relabelled(
+        self, plugin, deadline
+    ):
+        deadline(TOOL_CALL_BUDGET_S)
+        plugin.client.get = AsyncMock(side_effect=TimeoutError("socket"))
+        with pytest.raises(TimeoutError, match="socket"):
+            await plugin._send_once("get", LAYER)
+
+    @pytest.mark.asyncio
+    async def test_cpu_loop_stops_when_budget_is_spent(
+        self, plugin, deadline
+    ):
+        deadline(-1)
+        with pytest.raises(UpstreamTimeoutError, match="computation"):
+            plugin._check_budget()
+
+    @pytest.mark.asyncio
+    async def test_cpu_check_reads_the_clock_only_every_nth(
+        self, plugin, deadline
+    ):
+        deadline(-1)
+        plugin._check_budget(7, 50)  # not a multiple: no check
+        with pytest.raises(UpstreamTimeoutError):
+            plugin._check_budget(100, 50)
+
+    @pytest.mark.asyncio
+    async def test_cpu_check_is_silent_inside_budget_or_without_one(
+        self, plugin, deadline
+    ):
+        plugin._check_budget()
+        deadline(TOOL_CALL_BUDGET_S)
+        plugin._check_budget()
 
 
 class TestRequestJsonWithRetry:

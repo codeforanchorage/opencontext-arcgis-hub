@@ -28,7 +28,7 @@ Used by: Anchorage GIS (`anchorage-gis-mcp`) and the Alaska Geoportal
 Pin a tag in `requirements.txt` and `pyproject.toml`:
 
 ```
-opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.1.0
+opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.1.1
 ```
 
 Then subclass in `plugins/<name>/plugin.py`:
@@ -111,6 +111,17 @@ Do not run `ruff format` across the repo; the source is hand-wrapped and
 not format-clean.
 
 ## Releases
+
+**1.1.1** — the per-call time budget is a real deadline.
+
+- Each upstream request is cut off when the call's budget runs out. The
+  budget was applied as an httpx timeout, which bounds each read rather
+  than the whole request, so a response that kept trickling in could
+  run past the budget and the function's own timeout.
+- The feature-matching loops of `aggregate_by_polygon` and
+  `coverage_by_polygon` check the budget as they go. They never wait on
+  the network, so nothing stopped a long one; it now ends with an error
+  that says to narrow the request.
 
 **1.1.0** — results that were wrong or partial without saying so, from
 a review of 1.0.0. Three changes are visible to callers and are why this

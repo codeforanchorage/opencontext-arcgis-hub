@@ -4403,18 +4403,43 @@ class ArcGISHubPlugin(DataPlugin):
             return cap
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise UpstreamTimeoutError(
-                f"ArcGIS did not finish answering within this call's "
-                f"{TOOL_CALL_BUDGET_S:g}s budget. The service may be slow "
-                "right now; try again shortly, or narrow the request (a "
-                "tighter WHERE clause, fewer fields, a smaller limit)."
-            )
+            raise self._budget_spent()
         limit = cap
         if limit is None:
             limit = getattr(self.plugin_config, "timeout", None)
         if limit is not None and remaining < limit:
             return remaining
         return cap
+
+    @staticmethod
+    def _budget_spent() -> UpstreamTimeoutError:
+        return UpstreamTimeoutError(
+            f"ArcGIS did not finish answering within this call's "
+            f"{TOOL_CALL_BUDGET_S:g}s budget. The service may be slow "
+            "right now; try again shortly, or narrow the request (a "
+            "tighter WHERE clause, fewer fields, a smaller limit)."
+        )
+
+    @staticmethod
+    def _check_budget(i: int = 0, every: int = 1) -> None:
+        """Raise once the call budget is spent; for loops that do not await.
+
+        The request timeouts only bound time spent waiting on ArcGIS.
+        Matching thousands of features against polygons is pure CPU and
+        never yields, so nothing else would stop it before the Lambda is
+        killed. Pass the loop index and ``every`` to look at the clock
+        only on every Nth iteration.
+        """
+        if every > 1 and i % every:
+            return
+        deadline = _call_deadline.get()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise UpstreamTimeoutError(
+                f"This request needed more computation than fits in a "
+                f"call's {TOOL_CALL_BUDGET_S:g}s budget. Narrow it: a "
+                "tighter WHERE clause on either layer, a smaller buffer, "
+                "or fewer features."
+            )
 
     @staticmethod
     def _url_label(url: str) -> str:
@@ -4454,15 +4479,30 @@ class ArcGISHubPlugin(DataPlugin):
         A timeout raises a readable UpstreamTimeoutError: an httpx timeout
         stringifies to '', which is how callers used to get a bare "Tool
         execution failed".
+
+        The httpx timeout is per phase (connect, each read, write, pool),
+        not for the whole request: a server that keeps sending a few
+        bytes inside every read window never trips it. The call deadline
+        is therefore enforced separately, as a wall-clock limit on the
+        whole request.
         """
         effective = self._request_timeout(timeout)
         kwargs: Dict[str, Any] = {}
         if effective is not None:
             kwargs["timeout"] = effective
+        deadline = _call_deadline.get()
+        hard = None
+        if deadline is not None:
+            hard = max(deadline - time.monotonic(), 0.0)
         try:
-            if method == "post":
-                return await self.client.post(url, data=data, **kwargs)
-            return await self.client.get(url, params=params, **kwargs)
+            async with asyncio.timeout(hard) as scope:
+                if method == "post":
+                    return await self.client.post(url, data=data, **kwargs)
+                return await self.client.get(url, params=params, **kwargs)
+        except TimeoutError as e:
+            if not scope.expired():
+                raise
+            raise self._budget_spent() from e
         except httpx.TimeoutException as e:
             seconds = effective or getattr(self.plugin_config, "timeout", 0)
             raise UpstreamTimeoutError(
@@ -4842,7 +4882,8 @@ class ArcGISHubPlugin(DataPlugin):
         # Reduce each source feature to a point.
         source_points: List[Tuple[Tuple[float, float], Dict[str, Any]]] = []
         no_geometry_count = 0
-        for feat in source_features:
+        for i, feat in enumerate(source_features):
+            self._check_budget(i, 200)
             props = feat.get("properties") or {}
             geom = feat.get("geometry") or {}
             point = self._feature_to_point(geom, centroid_mode)
@@ -4870,7 +4911,8 @@ class ArcGISHubPlugin(DataPlugin):
         )
         unmatched_count = 0
         multi_bucket_count = 0
-        for point, props in source_points:
+        for i, (point, props) in enumerate(source_points):
+            self._check_budget(i, 50)
             px, py = point
             # Buffer padding in degrees, consistent with the cos(lat)
             # scaling _point_to_geometry_distance_m uses, so the prefilter
@@ -5417,7 +5459,8 @@ class ArcGISHubPlugin(DataPlugin):
             )
             if len(feats) >= self.COVERAGE_OVERLAY_LIMIT:
                 overlay_truncated = True
-            for f in feats:
+            for i, f in enumerate(feats):
+                self._check_budget(i, 200)
                 oid = f.get("id")
                 if oid is not None:
                     if oid in seen_overlay:
@@ -5435,7 +5478,8 @@ class ArcGISHubPlugin(DataPlugin):
         # Assign each overlay feature to the target whose polygon contains its
         # centroid (bbox prefilter), summing overlay area. Centroid assignment
         # gives each footprint to exactly one parcel (no double-count).
-        for pt, a in overlay_pts:
+        for i, (pt, a) in enumerate(overlay_pts):
+            self._check_budget(i, 200)
             px, py = pt
             for p in parcels:
                 bb = p["bbox"]
