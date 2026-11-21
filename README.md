@@ -112,6 +112,26 @@ not format-clean.
 
 ## Releases
 
+**1.2.2** — the aggregation-layer cache, now that it outlives a request.
+Until opencontext-core 1.5.0 a plugin object lived for one Lambda request,
+so `aggregate_by_polygon`'s cache of boundary polygons was never reused;
+since 1.5.0 one object serves a warm container for hours and the cache is
+real. Two things about it were only safe while it was not:
+
+- **Freshness.** A cached set was served for 24 hours with no check, so a
+  layer edited upstream was bucketed against the old boundaries under a
+  fresh "Retrieved" stamp. A set is now reused only while the layer's
+  edit date (from its metadata, itself cached for an hour) is unchanged;
+  a layer that reports no edit date is cached for one hour, not 24.
+- **Memory.** The cache was bounded at 32 entries, not by size: one set
+  of ~5,000 simple parcel polygons measured ~9 MB in memory, so a full
+  cache was ~290 MB, and any caller could fill it by varying `agg_where`.
+  It is now also bounded at 16 MB of polygon JSON in total (on the order
+  of 130 MB in memory), evicting least-recently-used sets; a single set
+  larger than that is returned without being cached.
+
+No change to a result computed from current data.
+
 **1.2.1** — clearer errors, found by probing every tool on a live server
 with bad input. No change to a successful result:
 

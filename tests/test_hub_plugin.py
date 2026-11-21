@@ -1242,10 +1242,12 @@ class TestAggregateByPolygon:
                 _AGG_ID, "COUNCIL", "1=1"
             )
         assert r1 == r2
-        # Second call should NOT have refetched.
-        assert resolve.await_count == 1
-        assert meta.await_count == 1
+        # Second call should NOT have refetched the polygons. The layer's
+        # metadata IS consulted on every call (it is cached separately):
+        # its edit date is what says the cached polygons are still current.
         assert paged.await_count == 1
+        assert resolve.await_count == 2
+        assert meta.await_count == 2
 
 
 # ── filter_by_polygon ──────────────────────────────────────────────────

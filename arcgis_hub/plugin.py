@@ -216,10 +216,12 @@ class ArcGISHubPlugin(DataPlugin):
         super().__init__(config)
         self.plugin_config: Optional[ArcGISHubPluginConfig] = None
         self.client: Optional[httpx.AsyncClient] = None
-        # LRU {(item_id, group_by_field, agg_where): (expires_epoch, polygons)}.
-        # Bounded to prevent memory exhaustion via agg_where variants that
-        # miss the cache (e.g. "1=1 AND 1=1" vs "1=1 AND 2=2").
-        self._agg_layer_cache: "OrderedDict[Tuple[str, str, str], Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+        # LRU {(item_id, group_by_field, agg_where):
+        #      (expires_epoch, polygons, layer_edit_stamp, approx_bytes)}.
+        # Bounded by entry count AND by total size, to prevent memory
+        # exhaustion via agg_where variants that miss the cache
+        # (e.g. "1=1 AND 1=1" vs "1=1 AND 2=2"). See AGG_CACHE_MAX_BYTES.
+        self._agg_layer_cache: "OrderedDict[Tuple[str, str, str], Tuple[float, List[Dict[str, Any]], Any, int]]" = OrderedDict()
         # LRU {key: (expires_monotonic, json)} for portal item records and
         # layer/service ?f=json metadata. See META_CACHE_TTL_S.
         self._meta_cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
@@ -3586,15 +3588,28 @@ class ArcGISHubPlugin(DataPlugin):
 
     # ── Aggregation helpers ───────────────────────────────────────────────
 
-    # Cache TTL for aggregation layers (councils, districts, etc.). Boundary
-    # layers change rarely; paying 24h of staleness buys a huge hit-rate win
-    # on repeat analyses.
+    # Cache TTL for aggregation layers (councils, districts, etc.) WHEN THE
+    # LAYER REPORTS AN EDIT DATE. A cached set is then reused only while that
+    # date is unchanged, so the TTL is a backstop and an edited layer is
+    # picked up as soon as its (1h-cached) metadata shows the new date.
     AGG_CACHE_TTL_SECONDS = 86400
+    # TTL when the layer reports NO edit date, so there is nothing to check
+    # freshness against. Matches the metadata cache: an hour of staleness at
+    # most. (Until opencontext-core 1.5.0 a plugin object lived for one
+    # request and this cache never survived to be stale; since 1.5.0 one
+    # object serves a warm container for hours.)
+    AGG_CACHE_TTL_NO_EDIT_DATE_SECONDS = 3600
 
-    # Cap on LRU entries. Each entry can hold up to AGG_SOURCE_LIMIT polygons;
-    # this bounds worst-case memory at roughly 32 * ~5 MB = ~160 MB and
-    # defangs WHERE-clause-variant cache-busting DoS attempts.
+    # Cap on LRU entries, and defence against WHERE-clause-variant
+    # cache-busting. The count alone does not bound memory: see below.
     AGG_CACHE_MAX_ENTRIES = 32
+    # Cap on the cache's total size, measured as the polygons' compact JSON
+    # length. One set of ~5,000 simple parcel polygons is ~1.1 MB of JSON
+    # and ~9 MB of Python objects (measured), so 16 MB here is on the order
+    # of 130 MB of process memory -- where 32 such entries, which the entry
+    # cap alone allowed, would be ~290 MB, and detailed boundaries several
+    # times that. A single set larger than the cap is returned uncached.
+    AGG_CACHE_MAX_BYTES = 16 * 1024 * 1024
 
     # Safety cap on source features pulled for a single aggregation call.
     # A council-by-council rollup of a city-wide dataset is typically a few
@@ -4464,18 +4479,28 @@ class ArcGISHubPlugin(DataPlugin):
             validated_where,
         )
         now = time.time()
-        cached = self._agg_layer_cache.get(cache_key)
-        if cached and cached[0] > now:
-            self._agg_layer_cache.move_to_end(cache_key)
-            return cached[1]
-        if cached:
-            # Expired -- drop and refetch.
-            del self._agg_layer_cache[cache_key]
-
+        # The layer's metadata is read BEFORE the cache is consulted (it is
+        # itself cached for META_CACHE_TTL_S, so this is usually free): its
+        # edit date is what says whether a cached set is still the layer.
         layer_url = await self._resolve_layer_url(aggregation_item_id)
         meta = await self._fetch_layer_meta(
             layer_url, require_fields=(group_by_field,)
         )
+        editing = meta.get("editingInfo") or {}
+        edit_stamp = editing.get("dataLastEditDate") or editing.get(
+            "lastEditDate"
+        )
+        if not isinstance(edit_stamp, (int, float)):
+            edit_stamp = None
+
+        cached = self._agg_layer_cache.get(cache_key)
+        if cached and cached[0] > now and cached[2] == edit_stamp:
+            self._agg_layer_cache.move_to_end(cache_key)
+            return cached[1]
+        if cached:
+            # Expired, or the layer was edited since -- drop and refetch.
+            del self._agg_layer_cache[cache_key]
+
         geom_type = meta.get("geometryType", "")
         if geom_type not in (
             "esriGeometryPolygon",
@@ -4518,12 +4543,34 @@ class ArcGISHubPlugin(DataPlugin):
             for f in polygons
             if f.get("geometry")
         ]
-        self._agg_layer_cache[cache_key] = (
-            now + self.AGG_CACHE_TTL_SECONDS,
-            result,
+        try:
+            approx_bytes = len(json.dumps(result, separators=(",", ":")))
+        except (TypeError, ValueError):
+            approx_bytes = self.AGG_CACHE_MAX_BYTES + 1  # unmeasurable: don't keep
+        if approx_bytes > self.AGG_CACHE_MAX_BYTES:
+            # Too large to keep at all: caching it would evict everything
+            # else and still exceed the bound.
+            return result
+        ttl = (
+            self.AGG_CACHE_TTL_SECONDS
+            if edit_stamp is not None
+            else min(
+                self.AGG_CACHE_TTL_SECONDS,
+                self.AGG_CACHE_TTL_NO_EDIT_DATE_SECONDS,
+            )
         )
-        # LRU eviction to bound memory under cache-busting inputs.
-        while len(self._agg_layer_cache) > self.AGG_CACHE_MAX_ENTRIES:
+        self._agg_layer_cache[cache_key] = (
+            now + ttl,
+            result,
+            edit_stamp,
+            approx_bytes,
+        )
+        # LRU eviction to bound memory under cache-busting inputs: by entry
+        # count, and by total size (the newest entry always fits, above).
+        while len(self._agg_layer_cache) > self.AGG_CACHE_MAX_ENTRIES or (
+            sum(entry[3] for entry in self._agg_layer_cache.values())
+            > self.AGG_CACHE_MAX_BYTES
+        ):
             self._agg_layer_cache.popitem(last=False)
         return result
 
