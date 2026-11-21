@@ -128,6 +128,27 @@ class TestWhereValidatorAgainstSchema:
                 "status='Active'", {"STATUS"}
             )
 
+    def test_unknown_field_error_ends_with_the_schema_tool(self):
+        with pytest.raises(ToolInputError) as raised:
+            WhereValidator.validate_against_schema("FOO='x'", {"STATUS"})
+        assert str(raised.value).endswith(
+            "Call get_layer_schema to see all available field names."
+        )
+
+    def test_a_server_without_that_tool_passes_its_own_hint(self):
+        """A deployment that uses the validators but is not an
+        ArcGISHubPlugin (anchorage-parcels-mcp) has no get_layer_schema."""
+        hint = "Use query_parcels with out_fields='*' to see every field."
+        with pytest.raises(ToolInputError) as raised:
+            WhereValidator.validate_against_schema(
+                "STATU='x'", {"STATUS"}, schema_hint=hint
+            )
+        message = str(raised.value)
+        assert message.endswith(hint)
+        assert "get_layer_schema" not in message
+        # The did-you-mean is the validator's own and is kept.
+        assert "did you mean 'STATUS'" in message
+
     def test_string_values_not_treated_as_fields(self):
         # The literal 'Park' must not be flagged as an unknown field.
         WhereValidator.validate_against_schema(

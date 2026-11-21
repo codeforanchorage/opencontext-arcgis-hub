@@ -194,11 +194,21 @@ class WhereValidator:
     _NUM_LITERAL_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
     _IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 
+    # Closing sentence of an unknown-field error: where the caller can
+    # see the real field names. The default names the tool every
+    # ArcGISHubPlugin deployment has. A server without that tool passes
+    # its own ``schema_hint``; a caller following advice to call a tool
+    # that does not exist there gets "Unknown tool" back.
+    DEFAULT_SCHEMA_HINT = (
+        "Call get_layer_schema to see all available field names."
+    )
+
     @classmethod
     def validate_against_schema(
         cls,
         where: str,
         allowed_fields: Optional[Iterable[str]],
+        schema_hint: Optional[str] = None,
     ) -> None:
         """Verify every identifier in ``where`` is a real layer field.
 
@@ -215,6 +225,9 @@ class WhereValidator:
                 names in ArcGIS are case-sensitive. Pass ``None`` /
                 empty to skip the check (e.g. when the schema fetch
                 failed -- graceful degradation).
+            schema_hint: Sentence that ends the error, telling the
+                caller how to see the field names on THIS server.
+                Defaults to ``DEFAULT_SCHEMA_HINT``.
 
         Raises:
             ValueError: When the WHERE references an identifier that
@@ -261,9 +274,7 @@ class WhereValidator:
                 parts.append(
                     f"Field {u!r} not found in this layer."
                 )
-        parts.append(
-            "Call get_layer_schema to see all available field names."
-        )
+        parts.append(schema_hint or cls.DEFAULT_SCHEMA_HINT)
         raise ToolInputError(" ".join(parts))
 
 

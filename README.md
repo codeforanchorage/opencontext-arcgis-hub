@@ -112,6 +112,14 @@ not format-clean.
 
 ## Releases
 
+**1.2.4** — `WhereValidator.validate_against_schema` takes an optional
+`schema_hint`: the sentence that ends an unknown-field error. It
+defaults to "Call get_layer_schema to see all available field names.",
+so nothing changes for an `ArcGISHubPlugin` deployment. A server that
+uses the validators without the plugin (anchorage-parcels-mcp) has no
+`get_layer_schema` tool and was replacing that sentence in the message
+after the fact; it now passes its own.
+
 **1.2.3** — `coverage_by_polygon` counted an overlay feature once per
 batch of targets it touched. Targets are queried in batches of 50, and a
 building that intersects targets in two batches comes back from both
