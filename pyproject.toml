@@ -1,6 +1,6 @@
 [project]
 name = "opencontext-arcgis-hub"
-version = "1.2.2"
+version = "1.2.3"
 description = "Shared ArcGIS Online / Hub plugin base for OpenContext MCP deployments: discovery, schema, attribute and spatial queries, polygon analytics, upstream resilience and structured output. Deployments subclass it with their region's specifics."
 license = {text = "MIT"}
 readme = "README.md"

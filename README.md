@@ -112,6 +112,27 @@ not format-clean.
 
 ## Releases
 
+**1.2.3** — `coverage_by_polygon` counted an overlay feature once per
+batch of targets it touched. Targets are queried in batches of 50, and a
+building that intersects targets in two batches comes back from both
+queries. The code de-duplicated on the GeoJSON feature `id`, but ArcGIS
+only sends an `id` when the object-id field is among `outFields`, and
+only the area field was requested, so every `id` was `None` and nothing
+was ever de-duplicated. On the deployed Anchorage server one parcel read
+38% covered in a 400-target call and 19% queried alone; 47 of 400
+targets changed once the duplicates were removed.
+
+- The overlay query now requests the layer's object-id field, and
+  features are de-duplicated on the id, else the object-id attribute,
+  else (for a layer with neither) the feature's representative point and
+  area.
+- The paged fetch's guard against a server that ignores `resultOffset`
+  keyed on the same missing `id` and so never fired for such fetches; it
+  now falls back to comparing the page's first feature.
+
+Coverage figures for calls with more than 50 targets can go DOWN with
+this release; the earlier figures were overstated.
+
 **1.2.2** — the aggregation-layer cache, now that it outlives a request.
 Until opencontext-core 1.5.0 a plugin object lived for one Lambda request,
 so `aggregate_by_polygon`'s cache of boundary polygons was never reused;

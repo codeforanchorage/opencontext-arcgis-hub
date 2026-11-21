@@ -4935,7 +4935,20 @@ class ArcGISHubPlugin(DataPlugin):
                 break
             # A server that ignores resultOffset returns page one again;
             # stop rather than collect the same features until `limit`.
-            first_id = page[0].get("id") if isinstance(page[0], dict) else None
+            # Identify the page by its first feature's `id` when the
+            # server sends one. It only does when the object-id field is
+            # among outFields, so otherwise use the feature itself; a
+            # guard keyed on `id` alone never fired for those fetches.
+            first_id: Any = None
+            if isinstance(page[0], dict):
+                first_id = page[0].get("id")
+                if first_id is None:
+                    try:
+                        first_id = json.dumps(
+                            page[0], sort_keys=True, separators=(",", ":")
+                        )
+                    except (TypeError, ValueError):
+                        first_id = None
             if offset and first_id is not None and first_id == last_first_id:
                 logger.warning(
                     "Paging stalled on %s: resultOffset=%s returned the "
@@ -5705,6 +5718,17 @@ class ArcGISHubPlugin(DataPlugin):
         overlay_truncated = False
         seen_overlay: set = set()
         overlay_pts: List[Tuple[Tuple[float, float], float]] = []
+        # An overlay feature that touches targets in two batches comes
+        # back from both queries and must be counted once. ArcGIS puts an
+        # `id` on a GeoJSON feature ONLY when the object-id field is in
+        # outFields, so it is requested here; without it every feature's
+        # id was None, the de-duplication below never ran, and a building
+        # on a batch boundary was credited once per batch (a parcel read
+        # 38% covered in a 400-target call and 19% on its own).
+        overlay_oid_field = self._oid_field_name(overlay_meta)
+        overlay_out_fields = overlay_area_field
+        if overlay_oid_field and overlay_oid_field != overlay_area_field:
+            overlay_out_fields = f"{overlay_area_field},{overlay_oid_field}"
         for batch, multi_coords in self._coverage_batches(parcels):
             esri = self._geojson_to_esri_polygon(
                 {"type": "MultiPolygon", "coordinates": multi_coords}
@@ -5725,7 +5749,7 @@ class ArcGISHubPlugin(DataPlugin):
             feats = await self._paged_geojson_fetch(
                 overlay_url,
                 where=overlay_where,
-                out_fields=overlay_area_field,
+                out_fields=overlay_out_fields,
                 limit=self.COVERAGE_OVERLAY_LIMIT,
                 method="post",
                 extra_params={
@@ -5739,18 +5763,29 @@ class ArcGISHubPlugin(DataPlugin):
                 overlay_truncated = True
             for i, f in enumerate(feats):
                 self._check_budget(i, 200)
-                oid = f.get("id")
-                if oid is not None:
-                    if oid in seen_overlay:
-                        continue
-                    seen_overlay.add(oid)
+                props = f.get("properties") or {}
                 pt = self._feature_to_point(f.get("geometry") or {}, "auto")
                 if pt is None:
                     continue
                 try:
-                    a = float((f.get("properties") or {}).get(overlay_area_field))
+                    a = float(props.get(overlay_area_field))
                 except (TypeError, ValueError):
                     continue
+                # The feature's identity: its id, else its object-id
+                # attribute, else -- for a layer that offers neither --
+                # its representative point and area, which two distinct
+                # footprints do not share.
+                oid = f.get("id")
+                if oid is None and overlay_oid_field:
+                    oid = props.get(overlay_oid_field)
+                key: Any = (
+                    ("oid", oid)
+                    if oid is not None
+                    else ("geom", round(pt[0], 8), round(pt[1], 8), a)
+                )
+                if key in seen_overlay:
+                    continue
+                seen_overlay.add(key)
                 overlay_pts.append((pt, a))
 
         # Assign each overlay feature to EVERY target whose polygon
