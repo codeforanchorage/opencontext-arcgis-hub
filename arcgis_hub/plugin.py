@@ -271,13 +271,15 @@ class ArcGISHubPlugin(DataPlugin):
 
     # ── Portal search helpers ─────────────────────────────────────────────
 
-    async def _run_search(self, q: str, limit: int) -> List[Dict[str, Any]]:
+    async def _run_search(
+        self, q: str, limit: int, sort_field: str = "relevance"
+    ) -> List[Dict[str, Any]]:
         """Run a search against the ArcGIS Portal REST API."""
         params = {
             "q": q,
             "f": "json",
             "num": str(limit),
-            "sortField": "relevance",
+            "sortField": sort_field,
             "sortOrder": "desc",
         }
         resp = await self._send("get",
@@ -325,7 +327,11 @@ class ArcGISHubPlugin(DataPlugin):
         return await self._run_search(" AND ".join(clauses), limit)
 
     async def _search_org_layers(
-        self, query: str, item_types: List[str], limit: int
+        self,
+        query: str,
+        item_types: List[str],
+        limit: int,
+        sort_field: str = "relevance",
     ) -> List[Dict[str, Any]]:
         """Search the organization's spatial layers.
 
@@ -354,7 +360,12 @@ class ArcGISHubPlugin(DataPlugin):
         ]
         if query and self._user_query_clause(query):
             clauses.append(self._user_query_clause(query))
-        results = await self._run_search(" AND ".join(clauses), limit)
+        if sort_field == "relevance":
+            results = await self._run_search(" AND ".join(clauses), limit)
+        else:
+            results = await self._run_search(
+                " AND ".join(clauses), limit, sort_field=sort_field
+            )
         allowed = self._allowed_org_ids
         kept: List[Dict[str, Any]] = []
         for r in results:
@@ -2624,6 +2635,13 @@ class ArcGISHubPlugin(DataPlugin):
         ] + [self._item_record(i, "layers") for i in layer_results]
 
         if not gallery_results and not layer_results:
+            field_hits, inspected = await self._field_name_fallback(
+                topic, limit
+            )
+            if field_hits:
+                return self._field_fallback_result(
+                    topic, limit, field_hits, inspected
+                )
             retry = (
                 "Retry with a broader, simpler keyword. Strip "
                 "qualifiers like 'parcels', 'data', 'boundaries', "
@@ -2684,6 +2702,205 @@ class ArcGISHubPlugin(DataPlugin):
         return text, self._item_search_result(
             records, text=topic, limit=limit
         )
+
+    # ── find_gis_content: field-name fallback ─────────────────────────────
+    #
+    # The portal search reads titles, tags and descriptions, never field
+    # names. A topic that is an ATTRIBUTE rather than a layer ("speed
+    # limit" is a field on the streets layer) therefore finds nothing,
+    # and the model reports the data as missing. When the item search
+    # comes back empty, look for the topic among the field names of the
+    # most-viewed queryable layers. Bounded: a fixed number of services,
+    # a cap on layers per service, one overall time limit, and it only
+    # runs on what would otherwise be an empty answer.
+
+    # How many of the most-viewed services to inspect. 0 disables it.
+    FIELD_FALLBACK_SERVICES = 20
+    # Layers read per service; group services can hold dozens.
+    FIELD_FALLBACK_LAYERS_PER_SERVICE = 8
+    # Whole-fallback time limit; past it the answer is the plain
+    # "nothing found" one.
+    FIELD_FALLBACK_TIMEOUT_S = 8.0
+
+    @staticmethod
+    def _field_topic_tokens(topic: str) -> List[str]:
+        """The topic as lower-case words to look for in field names.
+
+        Words under 3 characters are dropped (they match everything) and
+        a plural "s" is removed, so "speed limits" finds SPEED_LIMIT.
+        """
+        tokens: List[str] = []
+        for word in re.findall(r"[a-z0-9]+", topic.lower()):
+            if (
+                len(word) > 3
+                and word.endswith("s")
+                and not word.endswith("ss")
+            ):
+                word = word[:-1]
+            if len(word) >= 3 and word not in tokens:
+                tokens.append(word)
+        return tokens
+
+    async def _field_name_fallback(
+        self, topic: str, limit: int
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Most-viewed layers with a field whose name matches ``topic``.
+
+        Returns ``(hits, services_inspected)``. Each hit is
+        ``{"item": <portal item>, "fields": [{"name", "alias",
+        "layer_index", "layer_name"}]}``, in most-viewed order. A field
+        matches when EVERY topic word appears in its name or alias. Any
+        failure yields ``([], 0)``: this is a best-effort extra on an
+        answer that is otherwise "nothing found".
+        """
+        tokens = self._field_topic_tokens(topic)
+        if not tokens or self.FIELD_FALLBACK_SERVICES <= 0:
+            return [], 0
+        try:
+            return await asyncio.wait_for(
+                self._field_name_fallback_scan(tokens, limit),
+                timeout=self.FIELD_FALLBACK_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.info(
+                "find_gis_content field-name fallback gave up: %s",
+                type(exc).__name__,
+            )
+            return [], 0
+
+    async def _field_name_fallback_scan(
+        self, tokens: List[str], limit: int
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        candidates = await self._search_org_layers(
+            "",
+            ["Feature Service", "Map Service"],
+            self.FIELD_FALLBACK_SERVICES,
+            sort_field="numViews",
+        )
+        sem = asyncio.Semaphore(5)
+
+        def _matches(field: Dict[str, Any]) -> bool:
+            hay = (
+                f"{field.get('name') or ''} {field.get('alias') or ''}"
+            ).lower()
+            return all(t in hay for t in tokens)
+
+        async def _layers(url: str) -> List[Tuple[Any, Dict[str, Any]]]:
+            root = await self._get_meta_json(url)
+            if re.search(r"/\d+$", url):
+                # The item URL is itself a layer (.../FeatureServer/0).
+                return [(root.get("id", 0), root)]
+            ids = [
+                entry.get("id", 0)
+                for entry in (root.get("layers") or [])
+                + (root.get("tables") or [])
+            ] or [0]
+            out: List[Tuple[Any, Dict[str, Any]]] = []
+            for layer_id in ids[: self.FIELD_FALLBACK_LAYERS_PER_SERVICE]:
+                try:
+                    out.append(
+                        (
+                            layer_id,
+                            await self._get_meta_json(f"{url}/{layer_id}"),
+                        )
+                    )
+                except Exception:
+                    continue
+            return out
+
+        async def _scan(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            url = (item.get("url") or "").rstrip("/")
+            if not url:
+                return None
+            try:
+                self._validate_service_url(url)
+                async with sem:
+                    layers = await _layers(url)
+            except Exception:
+                return None
+            fields = [
+                {
+                    "name": str(f.get("name") or ""),
+                    "alias": str(f.get("alias") or f.get("name") or ""),
+                    "layer_index": (
+                        layer_id if isinstance(layer_id, int) else 0
+                    ),
+                    "layer_name": str(meta.get("name") or ""),
+                }
+                for layer_id, meta in layers
+                for f in meta.get("fields") or []
+                if isinstance(f, dict) and f.get("name") and _matches(f)
+            ]
+            return {"item": item, "fields": fields} if fields else None
+
+        scanned = await asyncio.gather(*[_scan(c) for c in candidates])
+        hits = [h for h in scanned if h is not None]
+        return hits[: max(limit, 1)], len(candidates)
+
+    def _field_fallback_result(
+        self,
+        topic: str,
+        limit: int,
+        hits: List[Dict[str, Any]],
+        inspected: int,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """find_gis_content's answer when only field names matched."""
+        city = self.plugin_config.city_name
+        scope = (
+            f"Only the {inspected} most-viewed layers were checked; for "
+            f"others call search_layers_by_field(field_keyword=..., "
+            f"service_keyword=<a layer topic>)."
+        )
+        text = (
+            f"No {city} GIS item is titled or tagged '{topic}', but "
+            f"{len(hits)} layer(s) have a FIELD that matches it -- the "
+            f"topic is an attribute of these layers, not a layer of its "
+            f"own:\n\n"
+        )
+        records = []
+        for hit in hits:
+            record = self._item_record(hit["item"], "field_match")
+            record["matching_fields"] = hit["fields"]
+            records.append(record)
+            text += (
+                f"**{record['title']}**  _{record['type']}_ -- ID: "
+                f"`{record['item_id']}`\n"
+            )
+            for f in hit["fields"][:8]:
+                where = (
+                    f" (layer {f['layer_index']}: {f['layer_name']})"
+                    if f["layer_index"]
+                    else ""
+                )
+                text += f"- field `{f['name']}` ({f['alias']}){where}\n"
+            if len(hit["fields"]) > 8:
+                text += f"- ...and {len(hit['fields']) - 8} more\n"
+            text += f"{record['portal_url']}\n\n"
+        text += (
+            "---\n"
+            "**NEXT STEP:** `get_layer_schema(item_id)` to confirm the "
+            "field, then `query_data(item_id, where=..., "
+            "out_fields=...)`.\n"
+            f"{scope}"
+        )
+        structured = self._item_search_result(
+            records, text=topic, limit=limit
+        )
+        structured["caveats"].insert(
+            0,
+            {
+                "code": "matched_by_field_name",
+                "count": len(records),
+                "message": (
+                    f"No item is titled or tagged '{topic}'. These "
+                    f"layers were returned because a field name matches "
+                    f"it (see matching_fields): the topic is an "
+                    f"attribute of the layer. Query it with "
+                    f"get_layer_schema then query_data. {scope}"
+                ),
+            },
+        )
+        return text, structured
 
     def _format_layer_section(
         self, layer_results: List[Dict[str, Any]]
@@ -8090,11 +8307,30 @@ class ArcGISHubPlugin(DataPlugin):
             },
             "source": {
                 "type": "string",
-                "enum": ["gallery", "layers"],
+                "enum": ["gallery", "layers", "field_match"],
                 "description": (
                     "find_gis_content only: which search found it -- "
-                    "the curated public gallery or the org's layers."
+                    "the curated public gallery, the org's layers, or "
+                    "(when neither matched the topic) a field name on "
+                    "one of the most-viewed layers."
                 ),
+            },
+            "matching_fields": {
+                "type": "array",
+                "description": (
+                    "Only when source is 'field_match': the fields "
+                    "whose name or alias matched the topic."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["name", "alias", "layer_index"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "alias": {"type": "string"},
+                        "layer_index": {"type": "integer", "minimum": 0},
+                        "layer_name": {"type": "string"},
+                    },
+                },
             },
         },
     }

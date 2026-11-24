@@ -112,6 +112,22 @@ not format-clean.
 
 ## Releases
 
+**1.3.0** — `find_gis_content` falls through to field names when no item
+matches. The portal search reads titles, tags and descriptions, never
+field names, so a topic that is an attribute rather than a layer ("speed
+limit" is a field on Anchorage's streets layer) came back as "nothing
+found" and was reported to users as missing data. When both item
+searches are empty the tool now reads the field lists of the
+`FIELD_FALLBACK_SERVICES` (20) most-viewed Feature/Map Services and
+returns the layers where one field's name or alias contains every word
+of the topic. Those items carry `source: "field_match"` and a
+`matching_fields` list, and the result leads with a
+`matched_by_field_name` caveat that says how many layers were checked.
+It runs only on an otherwise empty answer, through the metadata cache,
+under an 8 s limit; any failure gives the old "nothing found" answer. A
+deployment sets `FIELD_FALLBACK_SERVICES = 0` to turn it off. The item
+record's `source` enum gains `field_match`, so `tools/list` changes.
+
 **1.2.4** — `WhereValidator.validate_against_schema` takes an optional
 `schema_hint`: the sentence that ends an unknown-field error. It
 defaults to "Call get_layer_schema to see all available field names.",
